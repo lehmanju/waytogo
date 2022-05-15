@@ -10,10 +10,11 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures::{ready, Sink, SinkExt, Stream};
+use futures::{ready, Sink, SinkExt, Stream, StreamExt};
 
 use pin_project_lite::pin_project;
 use smallvec::smallvec;
+use tokio::select;
 use tokio::{
     net::UnixStream,
     sync::mpsc::{channel, Receiver, Sender},
@@ -21,24 +22,15 @@ use tokio::{
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::{codec::Framed, sync::PollSender};
 
-use crate::wire::{Argument, Message, WaylandError, WaylandProtocol};
+use crate::wire::{Argument, Message, WaylandError, WaylandInterface, WaylandProtocol, WlObject};
 
 pub struct WaylandConnection {
     framed: Framed<UnixStream, WaylandProtocol>,
-    objects: HashMap<u32, Box<dyn Sink<Message, Error = WaylandError>>>,
+    objects: HashMap<u32, Box<dyn Sink<Message, Error = WaylandError> + Unpin>>,
     id_counter: Arc<AtomicU32>,
     //TODO use channels without Arc because its single-threaded
-    requests_rx: Receiver<Request>,
-    requests_tx: Sender<Request>,
-}
-
-pub enum Request {
-    NewObject(NewObjectReq),
-}
-
-pub struct NewObjectReq {
-    id: u32,
-    sink: Box<dyn Sink<Message, Error = WaylandError> + Send>,
+    requests_rx: Receiver<Message>,
+    requests_tx: Sender<Message>,
 }
 
 impl WaylandConnection {
@@ -51,7 +43,7 @@ impl WaylandConnection {
         let socket = UnixStream::connect(path).await?;
         // convert to framed
         let framed = Framed::new(socket, WaylandProtocol {});
-        let (tx, rx) = channel::<Request>(100);
+        let (tx, rx) = channel::<Message>(100);
         Ok(Self {
             framed,
             objects: HashMap::new(),
@@ -62,7 +54,7 @@ impl WaylandConnection {
     }
     async fn setup(
         &mut self,
-    ) -> Result<WlObject<PollSender<Request>, ReceiverStream<Message>, Registry>, WaylandError>
+    ) -> Result<WlObject<PollSender<Message>, ReceiverStream<Message>, WlRegistry>, WaylandError>
     {
         //send initial request
         let new_id = self.id_counter.fetch_add(1, Ordering::Relaxed);
@@ -83,17 +75,32 @@ impl WaylandConnection {
             id: new_id,
             request_tx: request_sink,
             message_rx: receiver_stream,
-            data: Registry {},
+            data: WlRegistry {},
         };
         self.objects.insert(new_id, Box::new(sender_sink));
         Ok(registry)
     }
     async fn run(mut self) {
+        let (mut writer, mut reader) = self.framed.split();
+        loop {
+            tokio::select! {
+                incoming = reader.next() => {
+                    let message = incoming.unwrap().unwrap();
+                    let sink = self.objects.get_mut(&message.sender_id).unwrap();
+                    sink.send(message).await.unwrap();
+                }
+                outgoing = self.requests_rx.recv() => {
+                    let message = outgoing.unwrap();
+                    writer.send(message).await.unwrap();
+                }
+            }
+        }
         //loop select
         //check framed receive
         //check request receive (send)
     }
 }
+pub type Registry = WlObject<PollSender<Message>, ReceiverStream<Message>, WlRegistry>;
 
 pub enum RegistryEvent {
     Global(GlobalEvent),
@@ -112,101 +119,61 @@ pub struct GlobalRemoveEvent {
 
 pub enum RegistryRequest {}
 
-pub struct Registry {}
+pub struct WlRegistry {}
 
-impl WaylandInterface for Registry {
+impl WaylandInterface for WlRegistry {
     type Event = RegistryEvent;
     type Request = RegistryRequest;
 
-    fn process(
-        &mut self,
-        message: Message,
-    ) -> Result<(Option<Self::Event>, Option<Request>), WaylandError> {
-        todo!()
-    }
-
-    fn request(&mut self, reguest: Self::Request) -> Result<Option<Request>, WaylandError> {
-        todo!()
-    }
-}
-
-pub trait WaylandInterface {
-    type Event;
-    type Request;
-    fn process(
-        &mut self,
-        message: Message,
-    ) -> Result<(Option<Self::Event>, Option<Request>), WaylandError>;
-    fn request(&mut self, reguest: Self::Request) -> Result<Option<Request>, WaylandError>;
-}
-
-pin_project! {
-    #[project=Proj]
-    pub struct WlObject<T: Sink<Request>, R: Stream<Item = Message>, D: WaylandInterface> {
-        id_counter: Arc<AtomicU32>,
-        id: u32,
-        #[pin]
-        request_tx: T,
-        #[pin]
-        message_rx: R,
-        data: D,
-    }
-}
-
-impl<T, R, D> WaylandInterface for WlObject<T, R, D>
-where
-    T: Sink<Request>,
-    R: Stream<Item = Message>,
-    D: WaylandInterface,
-{
-    type Event = D::Event;
-
-    fn process(
-        &mut self,
-        message: Message,
-    ) -> Result<(Option<Self::Event>, Option<Request>), WaylandError> {
-        self.data.process(message)
-    }
-
-    type Request = D::Request;
-
-    fn request(&mut self, reguest: Self::Request) -> Result<Option<Request>, WaylandError> {
-        todo!()
-    }
-}
-
-impl<T, R, D> Stream for WlObject<T, R, D>
-where
-    T: Sink<Request>,
-    R: Stream<Item = Message>,
-    D: WaylandInterface,
-{
-    type Item = Result<D::Event, WaylandError>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let Proj {
-            id_counter,
-            id,
-            request_tx,
-            mut message_rx,
-            mut data,
-        } = self.project();
-        match message_rx.as_mut().poll_next(cx) {
-            Poll::Ready(value) => {
-                match value {
-                    Some(message) => {
-                        let (result, response) = data.process(message)?;
-                        // return result if Some
-                        // send response to queue
-                    }
-                    None => todo!(),
+    fn process(&mut self, message: Message) -> Result<Option<Self::Event>, WaylandError> {
+        let Message {
+            sender_id: _,
+            opcode,
+            mut args,
+        } = message;
+        match opcode {
+            0 => {
+                let name: u32;
+                let interface: String;
+                let version: u32;
+                if let Argument::Uint(value) = args.remove(0) {
+                    name = value;
+                } else {
+                    return Err(WaylandError::ParseError);
                 }
-                todo!()
+                if let Argument::Str(value) = args.remove(0) {
+                    interface = value.into_string()?;
+                } else {
+                    return Err(WaylandError::ParseError);
+                }
+                if let Argument::Uint(value) = args.remove(0) {
+                    version = value;
+                } else {
+                    return Err(WaylandError::ParseError);
+                }
+                Ok(Some(RegistryEvent::Global(GlobalEvent {
+                    name,
+                    interface,
+                    version,
+                })))
             }
-            Poll::Pending => Poll::Pending,
+            1 => {
+                let name: u32;
+                if let Argument::Uint(value) = args.remove(0) {
+                    name = value;
+                } else {
+                    return Err(WaylandError::ParseError);
+                }
+
+                Ok(Some(RegistryEvent::GlobalRemove(GlobalRemoveEvent {
+                    name,
+                })))
+            }
+            _ => Err(WaylandError::UnknownOpcode(opcode)),
         }
+    }
+
+    fn request(&mut self, _request: Self::Request) -> Result<Option<Message>, WaylandError> {
+        Ok(None)
     }
 }

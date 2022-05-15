@@ -8,8 +8,8 @@ use tokio::net::UnixStream;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 use wire::{Argument, Message, WaylandProtocol};
 
-mod wire;
-mod connection;
+pub mod connection;
+pub mod wire;
 
 #[macro_use]
 extern crate wayland_sys;
