@@ -245,7 +245,8 @@ pub const MAX_BYTES_OUT: usize = 4096;
 pub struct WlSocket {
     inner: AsyncFd<UnixStream>,
     ancillary_buffer: Vec<u8>,
-    buffer: BytesMut,
+    read_buffer: BytesMut,
+    write_buffer: BytesMut,
     fds: VecDeque<RawFd>,
     header: Option<Header>,
     unprocessed_msg: Option<RawMessage>,
@@ -258,7 +259,8 @@ impl WlSocket {
         Ok(Self {
             inner: AsyncFd::new(socket)?,
             ancillary_buffer: cmsg_space!([RawFd; MAX_FDS_OUT]),
-            buffer: BytesMut::new(),
+            read_buffer: BytesMut::new(),
+            write_buffer: BytesMut::new(),
             fds: VecDeque::new(),
             header: None,
             unprocessed_msg: None,
@@ -266,37 +268,37 @@ impl WlSocket {
     }
 
     fn decode_raw(&mut self) -> Result<Option<RawMessage>, WaylandError> {
-        const header_len: usize = 8;
+        const HEADER_LEN: usize = 8;
 
         if let Some(header) = self.header.take() {
             // header already received, try to parse message
-            let remaining_bytes = header.message_size as usize - header_len;
-            if self.buffer.remaining() < remaining_bytes {
+            let remaining_bytes = header.message_size as usize - HEADER_LEN;
+            if self.read_buffer.remaining() < remaining_bytes {
                 self.header = Some(header);
                 return Ok(None);
             } else {
                 // complete message in buffer
-                let args = self.buffer.copy_to_bytes(remaining_bytes);
+                let args = self.read_buffer.copy_to_bytes(remaining_bytes);
                 Ok(Some(RawMessage { header, args }))
             }
         } else {
             // no header received yet, try to parse header
-            if self.buffer.remaining() < header_len {
-                self.buffer.reserve(header_len);
+            if self.read_buffer.remaining() < HEADER_LEN {
+                self.read_buffer.reserve(HEADER_LEN);
                 return Ok(None);
             }
 
-            let object_id = self.buffer.get_u32();
-            let message_size = self.buffer.get_u16();
-            let opcode = self.buffer.get_u16();
+            let object_id = self.read_buffer.get_u32();
+            let message_size = self.read_buffer.get_u16();
+            let opcode = self.read_buffer.get_u16();
 
             self.header = Some(Header {
                 object_id,
                 message_size,
                 opcode,
             });
-            let remaining_bytes = message_size as usize - header_len;
-            self.buffer.reserve(message_size as usize + header_len);
+            let remaining_bytes = message_size as usize - HEADER_LEN;
+            self.read_buffer.reserve(remaining_bytes + HEADER_LEN);
 
             self.decode_raw()
         }
@@ -367,8 +369,8 @@ impl WlSocket {
     ) -> Result<Message, WaylandError> {
         loop {
             let mut guard = self.inner.readable().await?;
-            let bytes_read = match guard.try_io(|inner| {
-                let mut iov = [IoSliceMut::new(&mut self.buffer)];
+            match guard.try_io(|inner| {
+                let mut iov = [IoSliceMut::new(&mut self.read_buffer)];
                 let msg = socket::recvmsg::<()>(
                     inner.as_raw_fd(),
                     &mut iov[..],

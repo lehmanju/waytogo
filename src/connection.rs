@@ -38,7 +38,7 @@ pub struct WaylandConnection {
 }
 
 impl WaylandConnection {
-    pub async fn new() -> io::Result<Self> {
+    pub fn new() -> io::Result<Self> {
         // create socket connection
         let xdg_dir = env::var_os("XDG_RUNTIME_DIR").unwrap();
         let wayland_display = env::var_os("WAYLAND_DISPLAY").unwrap();
@@ -79,6 +79,7 @@ impl WaylandConnection {
             data: WlRegistry {},
         };
         self.objects.insert(new_id, Box::new(sender_sink));
+        self.interfaces.insert(new_id, &REGISTRY_EVENTS);
         Ok(registry)
     }
     pub async fn run(mut self) {
@@ -133,12 +134,12 @@ impl WaylandInterface for WlRegistry {
     type Event = RegistryEvent;
     type Request = RegistryRequest;
 
-    fn process(&mut self, message: Message) -> Result<Option<Self::Event>, WaylandError> {
+    fn process(&mut self, mut message: Message) -> Result<Option<Self::Event>, WaylandError> {
         match message.opcode {
             0 => {
-                let name = message.args[0].into_uint().unwrap();
-                let interface: String = message.args[1].into_str().unwrap().into_string()?;
-                let version = message.args[2].into_uint().unwrap();
+                let name = message.args.remove(0).into_uint().unwrap();
+                let interface: String = message.args.remove(0).into_str().unwrap().into_string()?;
+                let version = message.args.remove(0).into_uint().unwrap();
                 Ok(Some(RegistryEvent::Global(GlobalEvent {
                     name,
                     interface,
@@ -146,7 +147,7 @@ impl WaylandInterface for WlRegistry {
                 })))
             }
             1 => {
-                let name = message.args[0].into_uint().unwrap();
+                let name = message.args.pop().unwrap().into_uint().unwrap();
 
                 Ok(Some(RegistryEvent::GlobalRemove(GlobalRemoveEvent {
                     name,
