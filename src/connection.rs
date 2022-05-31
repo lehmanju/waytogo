@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     env, io,
+    os::unix::prelude::AsRawFd,
     path::PathBuf,
     sync::{
         atomic::{AtomicU32, Ordering},
@@ -11,7 +12,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures::{ready, Sink, SinkExt, Stream, StreamExt};
-
+use phf::phf_map;
 use pin_project_lite::pin_project;
 use smallvec::smallvec;
 use tokio::select;
@@ -22,11 +23,14 @@ use tokio::{
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::{codec::Framed, sync::PollSender};
 
-use crate::wire::{Argument, Message, WaylandError, WaylandInterface, WaylandProtocol, WlObject};
+use crate::wire::{
+    Argument, ArgumentType, Message, RawMessage, WaylandError, WaylandInterface, WlObject, WlSocket,
+};
 
 pub struct WaylandConnection {
-    framed: Framed<UnixStream, WaylandProtocol>,
-    objects: HashMap<u32, Box<dyn Sink<Message, Error = WaylandError> + Unpin>>,
+    socket: WlSocket,
+    objects: HashMap<u32, Box<dyn Sink<Message, Error = WaylandError> + Unpin + Send>>,
+    interfaces: HashMap<u32, &'static phf::Map<u16, &'static [ArgumentType]>>,
     id_counter: Arc<AtomicU32>,
     //TODO use channels without Arc because its single-threaded
     requests_rx: Receiver<Message>,
@@ -37,25 +41,22 @@ impl WaylandConnection {
     pub async fn new() -> io::Result<Self> {
         // create socket connection
         let xdg_dir = env::var_os("XDG_RUNTIME_DIR").unwrap();
+        let wayland_display = env::var_os("WAYLAND_DISPLAY").unwrap();
         let mut path: PathBuf = xdg_dir.into();
-        path.push("wayland-0");
+        path.push(wayland_display);
 
-        let socket = UnixStream::connect(path).await?;
-        // convert to framed
-        let framed = Framed::new(socket, WaylandProtocol {});
+        let socket = WlSocket::connect(path)?;
         let (tx, rx) = channel::<Message>(100);
         Ok(Self {
-            framed,
+            socket,
             objects: HashMap::new(),
+            interfaces: HashMap::new(),
             id_counter: Arc::new(AtomicU32::new(2)),
             requests_rx: rx,
             requests_tx: tx,
         })
     }
-    async fn setup(
-        &mut self,
-    ) -> Result<WlObject<PollSender<Message>, ReceiverStream<Message>, WlRegistry>, WaylandError>
-    {
+    pub async fn setup(&mut self) -> Result<Registry, WaylandError> {
         //send initial request
         let new_id = self.id_counter.fetch_add(1, Ordering::Relaxed);
         let message = Message {
@@ -65,7 +66,7 @@ impl WaylandConnection {
                 Argument::NewId(new_id), // id of the created registry
             ],
         };
-        self.framed.send(message).await?;
+        self.socket.write_message(message).await?;
         let (sender, receiver) = channel::<Message>(10);
         let sender_sink = PollSender::new(sender).sink_err_into();
         let receiver_stream = ReceiverStream::new(receiver);
@@ -80,18 +81,17 @@ impl WaylandConnection {
         self.objects.insert(new_id, Box::new(sender_sink));
         Ok(registry)
     }
-    async fn run(mut self) {
-        let (mut writer, mut reader) = self.framed.split();
+    pub async fn run(mut self) {
         loop {
             tokio::select! {
-                incoming = reader.next() => {
-                    let message = incoming.unwrap().unwrap();
+                incoming = self.socket.read_message(&self.interfaces) => {
+                    let message = incoming.unwrap();
                     let sink = self.objects.get_mut(&message.sender_id).unwrap();
                     sink.send(message).await.unwrap();
                 }
                 outgoing = self.requests_rx.recv() => {
                     let message = outgoing.unwrap();
-                    writer.send(message).await.unwrap();
+                    self.socket.write_message(message).await.unwrap();
                 }
             }
         }
@@ -121,36 +121,24 @@ pub enum RegistryRequest {}
 
 pub struct WlRegistry {}
 
+static GLOBAL: &'static [ArgumentType] =
+    &[ArgumentType::Uint, ArgumentType::Str, ArgumentType::Uint];
+static GLOBAL_REMOVE: &'static [ArgumentType] = &[ArgumentType::Uint];
+static REGISTRY_EVENTS: phf::Map<u16, &[ArgumentType]> = phf_map! {
+    0u16 => GLOBAL,
+    1u16 => GLOBAL_REMOVE,
+};
+
 impl WaylandInterface for WlRegistry {
     type Event = RegistryEvent;
     type Request = RegistryRequest;
 
     fn process(&mut self, message: Message) -> Result<Option<Self::Event>, WaylandError> {
-        let Message {
-            sender_id: _,
-            opcode,
-            mut args,
-        } = message;
-        match opcode {
+        match message.opcode {
             0 => {
-                let name: u32;
-                let interface: String;
-                let version: u32;
-                if let Argument::Uint(value) = args.remove(0) {
-                    name = value;
-                } else {
-                    return Err(WaylandError::ParseError);
-                }
-                if let Argument::Str(value) = args.remove(0) {
-                    interface = value.into_string()?;
-                } else {
-                    return Err(WaylandError::ParseError);
-                }
-                if let Argument::Uint(value) = args.remove(0) {
-                    version = value;
-                } else {
-                    return Err(WaylandError::ParseError);
-                }
+                let name = message.args[0].into_uint().unwrap();
+                let interface: String = message.args[1].into_str().unwrap().into_string()?;
+                let version = message.args[2].into_uint().unwrap();
                 Ok(Some(RegistryEvent::Global(GlobalEvent {
                     name,
                     interface,
@@ -158,18 +146,13 @@ impl WaylandInterface for WlRegistry {
                 })))
             }
             1 => {
-                let name: u32;
-                if let Argument::Uint(value) = args.remove(0) {
-                    name = value;
-                } else {
-                    return Err(WaylandError::ParseError);
-                }
+                let name = message.args[0].into_uint().unwrap();
 
                 Ok(Some(RegistryEvent::GlobalRemove(GlobalRemoveEvent {
                     name,
                 })))
             }
-            _ => Err(WaylandError::UnknownOpcode(opcode)),
+            _ => Err(WaylandError::UnknownOpcode(message.opcode)),
         }
     }
 

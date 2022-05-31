@@ -20,4 +20,4 @@ pin-project-lite = "0.2"
 async-trait = "*"
 enum-as-inner = "*"
 nix = { version = "0.24", features = ["uio", "socket"] }
-phf = "0.10"
+phf = { version = "0.10", features = ["macros"] }

@@ -105,7 +105,7 @@ pub enum WaylandError {
     #[error("io error `{0}`")]
     IoError(#[from] io::Error),
     #[error("poll error `{0}`")]
-    PollError(#[from] PollSendError<RawMessage>),
+    PollError(#[from] PollSendError<Message>),
     #[error("unknown opcode `{0}`")]
     UnknownOpcode(u16),
     #[error("convert string failed `{0}`")]
@@ -252,7 +252,7 @@ pub struct WlSocket {
 }
 
 impl WlSocket {
-    pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+    pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let socket = UnixStream::connect(path)?;
         socket.set_nonblocking(true)?;
         Ok(Self {
@@ -304,16 +304,16 @@ impl WlSocket {
 
     fn decode(
         &mut self,
-        map: &HashMap<u32, &HashMap<u16, &[ArgumentType]>>,
+        map: &HashMap<u32, &phf::Map<u16, &[ArgumentType]>>,
     ) -> Result<Option<Message>, WaylandError> {
-        if let Some(raw_message) = &self.unprocessed_msg {
+        if let Some(mut raw_message) = self.unprocessed_msg.take() {
             let event_map = map.get(&raw_message.header.object_id).unwrap();
             let argument_list = *event_map.get(&raw_message.header.opcode).unwrap();
             if argument_list.len() > INLINE_ARGS {
                 panic!("Too many arguments for message")
             }
-            let args = SmallVec::new();
-            let used_fds = VecDeque::new();
+            let mut args = SmallVec::new();
+            let mut used_fds = VecDeque::new();
             for arg in argument_list {
                 let argument = match arg {
                     ArgumentType::Int => Argument::Int(raw_message.args.get_i32()),
@@ -363,7 +363,7 @@ impl WlSocket {
 
     pub async fn read_message(
         &mut self,
-        map: &HashMap<u32, &HashMap<u16, &[ArgumentType]>>,
+        map: &HashMap<u32, &phf::Map<u16, &[ArgumentType]>>,
     ) -> Result<Message, WaylandError> {
         loop {
             let mut guard = self.inner.readable().await?;
@@ -393,7 +393,7 @@ impl WlSocket {
         }
     }
 
-    pub async fn write_message(&mut self) -> Result<(), WaylandError> {
+    pub async fn write_message(&mut self, message: Message) -> Result<(), WaylandError> {
         let mut guard = self.inner.writable().await?;
         /*guard.try_io(|inner| {
 
