@@ -9,7 +9,7 @@ edition = "2021"
 wayland-sys = "0.29"
 log = "0.4"
 bitflags = "1.0"
-tokio = { version = "1.18", features = ["net", "macros"] }
+tokio = { version = "1.18", features = ["net", "macros", "rt"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio-stream = "0.1"
 bytes = "1.1"
@@ -18,4 +18,6 @@ thiserror = "1.0"
 futures = "0.3"
 pin-project-lite = "0.2"
 async-trait = "*"
-
+enum-as-inner = "*"
+nix = { version = "0.24", features = ["uio", "socket"] }
+phf = "0.10"
