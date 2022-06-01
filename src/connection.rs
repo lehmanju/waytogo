@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     env, io,
-    os::unix::prelude::AsRawFd,
+    os::unix::{net::UnixStream, prelude::AsRawFd},
     path::PathBuf,
     sync::{
         atomic::{AtomicU32, Ordering},
@@ -16,10 +16,7 @@ use phf::phf_map;
 use pin_project_lite::pin_project;
 use smallvec::smallvec;
 use tokio::select;
-use tokio::{
-    net::UnixStream,
-    sync::mpsc::{channel, Receiver, Sender},
-};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::{codec::Framed, sync::PollSender};
 
@@ -43,9 +40,12 @@ impl WaylandConnection {
         let xdg_dir = env::var_os("XDG_RUNTIME_DIR").unwrap();
         let wayland_display = env::var_os("WAYLAND_DISPLAY").unwrap();
         let mut path: PathBuf = xdg_dir.into();
-        path.push(wayland_display);
-
-        let socket = WlSocket::connect(path)?;
+        //path.push(wayland_display);
+        //path.push("wldbg-wayland-0");
+        path.push("wayland-0");
+        dbg!(&path);
+        let stream = UnixStream::connect(path)?;
+        let socket = WlSocket::new(stream)?;
         let (tx, rx) = channel::<Message>(100);
         Ok(Self {
             socket,
@@ -63,7 +63,7 @@ impl WaylandConnection {
             sender_id: 1, // wl_display
             opcode: 1,    // get registry
             args: smallvec![
-                Argument::NewId(new_id), // id of the created registry
+                Argument::NewId(2), // id of the created registry
             ],
         };
         self.socket.write_message(message).await?;
