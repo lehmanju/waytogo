@@ -200,23 +200,20 @@ where
                     data: new_object,
                 };
                 self.request_tx
-                    .send(WlConnectionMessage {
-                        message: request_message,
-                        flags: crate::connection::WlConnectionFlags::Create(
-                            *guard,
-                            Req::ReturnType::signature(),
-                            sender_sink,
-                        ),
-                    })
+                    .send(WlConnectionMessage::Create(
+                        *guard,
+                        Req::ReturnType::signature(),
+                        sender_sink,
+                    ))
+                    .await?;
+                self.request_tx
+                    .send(WlConnectionMessage::Message(request_message))
                     .await?;
                 Ok(Some(object))
             }
             None => {
                 self.request_tx
-                    .send(WlConnectionMessage {
-                        message: request_message,
-                        flags: crate::connection::WlConnectionFlags::Message,
-                    })
+                    .send(WlConnectionMessage::Message(request_message))
                     .await?;
                 Ok(None)
             }

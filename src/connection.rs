@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicU32, Ordering},
-        Arc,
+        Arc, RwLock,
     },
     task::Poll,
 };
@@ -18,32 +18,36 @@ use smallvec::smallvec;
 use tokio::select;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::{codec::Framed, sync::PollSender};
-
-use crate::wire::{
-    Argument, ArgumentType, Message, RawMessage, WaylandError, WaylandInterface, WlObject, WlSocket,
+use tokio_util::{
+    codec::Framed,
+    sync::{PollSendError, PollSender},
 };
+
+use crate::{
+    interfaces::{self, Registry},
+    wire::{ArgumentType, Message, Signature, WaylandError, WaylandInterface, WlObject, WlSocket},
+};
+use std::fmt::Debug;
 
 pub struct WaylandConnection {
     socket: WlSocket,
     objects: HashMap<u32, Box<dyn Sink<Message, Error = WaylandError> + Unpin + Send>>,
-    interfaces: HashMap<u32, &'static phf::Map<u16, &'static [ArgumentType]>>,
-    id_counter: Arc<AtomicU32>,
-    //TODO use channels without Arc because its single-threaded
+    interfaces: HashMap<u32, Signature>,
+    id_counter: Arc<RwLock<u32>>,
     requests_rx: Receiver<WlConnectionMessage>,
     requests_tx: Sender<WlConnectionMessage>,
 }
 
-pub struct WlConnectionMessage {
-    message: Message,
-    flags: WlConnectionFlags,
+#[derive(Debug)]
+pub enum WlConnectionMessage {
+    Create(u32, Signature, Box<dyn WlSink>),
+    Destroy(u32),
+    Message(Message),
 }
 
-pub enum WlConnectionFlags {
-    Create,
-    Destroy,
-    Message
-}
+pub trait WlSink: Sink<Message, Error = WaylandError> + Unpin + Send + Debug {}
+
+impl<T: Sink<Message, Error = WaylandError> + Unpin + Send + Debug> WlSink for T {}
 
 impl WaylandConnection {
     pub fn new() -> io::Result<Self> {
@@ -62,116 +66,61 @@ impl WaylandConnection {
             socket,
             objects: HashMap::new(),
             interfaces: HashMap::new(),
-            id_counter: Arc::new(AtomicU32::new(2)),
+            id_counter: Arc::new(RwLock::new(1)),
             requests_rx: rx,
             requests_tx: tx,
         })
     }
-    pub async fn setup(&mut self) -> Result<Registry, WaylandError> {
-        //send initial request
-        let new_id = self.id_counter.fetch_add(1, Ordering::Relaxed);
-        let message = Message {
-            sender_id: 1, // wl_display
-            opcode: 1,    // get registry
-            args: smallvec![
-                Argument::NewId(2), // id of the created registry
-            ],
-        };
-        self.socket.write_message(message).await?;
+    pub async fn setup<D: WaylandInterface>(
+        &mut self,
+        interface: D,
+    ) -> WlObject<PollSender<WlConnectionMessage>, ReceiverStream<Message>, D> {
+        if *self.id_counter.try_read().unwrap() != 1u32 {
+            panic!("setup can only be called once")
+        }
         let (sender, receiver) = channel::<Message>(10);
-        let sender_sink = PollSender::new(sender).sink_err_into();
+        let sender_sink = PollSender::new(sender);
         let receiver_stream = ReceiverStream::new(receiver);
         let request_sink = PollSender::new(self.requests_tx.clone());
+        let signature = D::signature();
         let registry = WlObject {
             id_counter: self.id_counter.clone(),
-            id: new_id,
+            id: 1u32,
             request_tx: request_sink,
             message_rx: receiver_stream,
-            data: WlRegistry {},
+            data: interface,
         };
-        self.objects.insert(new_id, Box::new(sender_sink));
-        self.interfaces.insert(new_id, &REGISTRY_EVENTS);
-        Ok(registry)
+        self.objects
+            .insert(1u32, Box::new(sender_sink.sink_err_into()));
+        self.interfaces.insert(1u32, signature);
+        registry
     }
     pub async fn run(mut self) {
         loop {
             tokio::select! {
                 incoming = self.socket.read_message(&self.interfaces) => {
-                    let message = incoming.unwrap();
-                    let mut sink = self.objects.remove(&message.sender_id).unwrap();
-                    sink.send(message).await.unwrap();
+                    self.read(incoming).await
                 }
                 outgoing = self.requests_rx.recv() => {
-                    let message = outgoing.unwrap();
-                    self.socket.write_message(message).await.unwrap();
+                    self.write(outgoing).await
                 }
             }
         }
-        //loop select
-        //check framed receive
-        //check request receive (send)
     }
-}
-pub type Registry = WlObject<PollSender<Message>, ReceiverStream<Message>, WlRegistry>;
 
-#[derive(Debug)]
-pub enum RegistryEvent {
-    Global(GlobalEvent),
-    GlobalRemove(GlobalRemoveEvent),
-}
+    async fn read(&mut self, incoming: Result<Message, WaylandError>) {
+        let message = incoming.unwrap();
+        let mut sink = self.objects.remove(&message.sender_id).unwrap();
+        sink.send(message).await.unwrap();
+    }
 
-#[derive(Debug)]
-pub struct GlobalEvent {
-    name: u32,
-    interface: String,
-    version: u32,
-}
-
-#[derive(Debug)]
-pub struct GlobalRemoveEvent {
-    name: u32,
-}
-
-pub enum RegistryRequest {}
-
-pub struct WlRegistry {}
-
-static GLOBAL: &'static [ArgumentType] =
-    &[ArgumentType::Uint, ArgumentType::Str, ArgumentType::Uint];
-static GLOBAL_REMOVE: &'static [ArgumentType] = &[ArgumentType::Uint];
-static REGISTRY_EVENTS: phf::Map<u16, &[ArgumentType]> = phf_map! {
-    0u16 => GLOBAL,
-    1u16 => GLOBAL_REMOVE,
-};
-
-impl WaylandInterface for WlRegistry {
-    type Event = RegistryEvent;
-    type Request = RegistryRequest;
-
-    fn process(&mut self, mut message: Message) -> Result<Option<Self::Event>, WaylandError> {
-        match message.opcode {
-            0 => {
-                let name = message.args.remove(0).into_uint().unwrap();
-                let interface: String = message.args.remove(0).into_str().unwrap().into_string()?;
-                let version = message.args.remove(0).into_uint().unwrap();
-                Ok(Some(RegistryEvent::Global(GlobalEvent {
-                    name,
-                    interface,
-                    version,
-                })))
+    async fn write(&mut self, outgoing: Option<WlConnectionMessage>) {
+        match outgoing.unwrap() {
+            WlConnectionMessage::Create(id, signature, sink) => todo!(),
+            WlConnectionMessage::Destroy(sink) => todo!(),
+            WlConnectionMessage::Message(message) => {
+                self.socket.write_message(message).await.unwrap()
             }
-            1 => {
-                let name = message.args.pop().unwrap().into_uint().unwrap();
-
-                Ok(Some(RegistryEvent::GlobalRemove(GlobalRemoveEvent {
-                    name,
-                })))
-            }
-            _ => Err(WaylandError::UnknownOpcode(message.opcode)),
         }
-    }
-
-    fn request(&mut self, _request: Self::Request) -> Result<Option<Message>, WaylandError> {
-        Ok(None)
     }
 }
