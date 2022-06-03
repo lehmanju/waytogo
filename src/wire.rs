@@ -6,23 +6,22 @@ use std::{
         net::UnixStream,
         prelude::{AsRawFd, RawFd},
     },
-    path::Path,
-    sync::{atomic::AtomicU32, Arc},
-    task::Poll,
+    sync::{Arc, RwLock},
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use enum_as_inner::EnumAsInner;
-use futures::{Sink, Stream};
+use futures::{Sink, SinkExt, Stream};
 use nix::{cmsg_space, errno::Errno, sys::socket};
-use pin_project_lite::pin_project;
 use smallvec::SmallVec;
 use thiserror::Error;
-use tokio::io::unix::{AsyncFd, TryIoError};
-use tokio_stream::StreamExt;
-use tokio_util::sync::PollSendError;
+use tokio::{io::unix::AsyncFd, sync::mpsc::channel};
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tokio_util::sync::{PollSendError, PollSender};
 
-use crate::{BufExt, BufMutExt, connection::WlConnectionMessage};
+use crate::{connection::WlConnectionMessage, BufExt, BufMutExt};
+
+pub type Signature = &'static phf::Map<u16, &'static [ArgumentType]>;
 
 #[derive(Debug, Clone)]
 pub struct Header {
@@ -76,6 +75,7 @@ pub enum Argument {
     Fd(RawFd),
 }
 
+#[derive(Debug)]
 pub enum ArgumentType {
     /// i32
     Int,
@@ -108,7 +108,7 @@ pub enum WaylandError {
     #[error("io error `{0}`")]
     IoError(#[from] io::Error),
     #[error("poll error `{0}`")]
-    PollError(#[from] PollSendError<Message>),
+    PollError(String),
     #[error("unknown opcode `{0}`")]
     UnknownOpcode(u16),
     #[error("convert string failed `{0}`")]
@@ -119,29 +119,56 @@ pub enum WaylandError {
     TryIoError,
 }
 
+impl<T> From<PollSendError<T>> for WaylandError {
+    fn from(err: PollSendError<T>) -> Self {
+        WaylandError::PollError(err.to_string())
+    }
+}
+
+/// Trait to be implemented on Wayland interface request types.
+///
+/// Although this trait can be implemented for foreign types,
+/// it is not of any use if the concrete type that implements WaylandInterface is private.
+pub trait RequestWithReturn {
+    type Interface: WaylandInterface;
+    type ReturnType: WaylandInterface;
+    /// Apply this request to `interface`.
+    /// Returns optionally a new Wayland interface for a new object and a Wayland message.
+    fn apply(self, interface: &mut Self::Interface) -> (Option<Self::ReturnType>, Message);
+}
+
 pub trait WaylandInterface {
     type Event;
-    type Request;
     /// Process a wayland message.
     ///
     /// This method expects a Message directly from the socket that corresponds to this wayland object. It returns an optional event that is sent to listeners further down the chain.
     /// Behavior is similar to StreamExt.scan
     fn process(&mut self, message: Message) -> Result<Option<Self::Event>, WaylandError>;
-    /// Map a request from this interface to a wayland request.
-    ///
-    /// The request is then sent directly to the socket.
-    fn request(&mut self, request: Self::Request) -> Result<Option<WlConnectionMessage>, WaylandError>;
+    fn signature() -> Signature;
 }
 
-pub struct WlObject<T: Sink<WlConnectionMessage>, R: Stream<Item = Message> + Unpin, D: WaylandInterface> {
-    pub id_counter: Arc<AtomicU32>,
+pub struct WlObject<
+    T: Sink<WlConnectionMessage> + Unpin + Clone,
+    R: Stream<Item = Message> + Unpin,
+    D: WaylandInterface,
+> where
+    WaylandError: From<T::Error>,
+{
+    pub id_counter: Arc<RwLock<u32>>,
     pub id: u32,
     pub request_tx: T,
     pub message_rx: R,
     pub data: D,
 }
 
-impl<T: Sink<WlConnectionMessage>, R: Stream<Item = Message> + Unpin, D: WaylandInterface> WlObject<T, R, D> {
+impl<
+        T: Sink<WlConnectionMessage> + Unpin + Clone,
+        R: Stream<Item = Message> + Unpin,
+        D: WaylandInterface,
+    > WlObject<T, R, D>
+where
+    WaylandError: From<T::Error>,
+{
     pub async fn next_message(&mut self) -> Result<Option<D::Event>, WaylandError> {
         loop {
             match self.message_rx.next().await {
@@ -153,8 +180,47 @@ impl<T: Sink<WlConnectionMessage>, R: Stream<Item = Message> + Unpin, D: Wayland
             };
         }
     }
-    pub async fn send_request(&mut self, request: D::Request) -> Result<(), T::Error> {
-        todo!()
+    pub async fn send_request<Req: RequestWithReturn<Interface = D>>(
+        &mut self,
+        request: Req,
+    ) -> Result<Option<WlObject<T, ReceiverStream<Message>, Req::ReturnType>>, WaylandError> {
+        let (return_value, request_message) = request.apply(&mut self.data);
+        match return_value {
+            Some(new_object) => {
+                let (sender, receiver) = channel::<Message>(10);
+                let sender_sink = Box::new(PollSender::new(sender).sink_err_into());
+                let receiver_stream = ReceiverStream::new(receiver);
+                let mut guard = self.id_counter.write().unwrap();
+                *guard += 1;
+                let object = WlObject {
+                    id_counter: self.id_counter.clone(),
+                    id: *guard,
+                    request_tx: self.request_tx.clone(),
+                    message_rx: receiver_stream,
+                    data: new_object,
+                };
+                self.request_tx
+                    .send(WlConnectionMessage {
+                        message: request_message,
+                        flags: crate::connection::WlConnectionFlags::Create(
+                            *guard,
+                            Req::ReturnType::signature(),
+                            sender_sink,
+                        ),
+                    })
+                    .await?;
+                Ok(Some(object))
+            }
+            None => {
+                self.request_tx
+                    .send(WlConnectionMessage {
+                        message: request_message,
+                        flags: crate::connection::WlConnectionFlags::Message,
+                    })
+                    .await?;
+                Ok(None)
+            }
+        }
     }
 }
 
