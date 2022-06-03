@@ -2,12 +2,8 @@ use phf::phf_map;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::PollSender;
 
-use crate::{
-    connection::WlConnectionMessage,
-    wire::{
-        Argument, ArgumentType, Message, RequestWithReturn, WaylandError, WaylandInterface,
-        WlObject,
-    },
+use crate::wire::{
+    Argument, ArgumentType, Message, RequestWithReturn, WaylandError, WaylandInterface, WlObject,
 };
 
 use smallvec::smallvec;
@@ -41,19 +37,19 @@ impl RequestWithReturn for GetRegistryRequest {
 impl WaylandInterface for WlDisplay {
     type Event = DisplayEvent;
 
-    fn process(&mut self, message: Message) -> Result<Option<Self::Event>, WaylandError> {
+    fn process(&mut self, _message: Message) -> Result<Option<Self::Event>, WaylandError> {
         todo!()
     }
 
     fn signature() -> &'static phf::Map<u16, &'static [ArgumentType]> {
-        static ERROR: &'static [ArgumentType] =
+        static ERROR: &[ArgumentType] =
             &[ArgumentType::Object, ArgumentType::Uint, ArgumentType::Str];
-        static DELETE_ID: &'static [ArgumentType] = &[ArgumentType::Uint];
+        static DELETE_ID: &[ArgumentType] = &[ArgumentType::Uint];
         static DISPLAY_EVENTS: phf::Map<u16, &[ArgumentType]> = phf_map! {
             0u16 => ERROR,
             1u16 => DELETE_ID,
         };
-        return &DISPLAY_EVENTS;
+        &DISPLAY_EVENTS
     }
 }
 
@@ -106,13 +102,13 @@ impl WaylandInterface for WlRegistry {
     }
 
     fn signature() -> &'static phf::Map<u16, &'static [ArgumentType]> {
-        static GLOBAL: &'static [ArgumentType] =
+        static GLOBAL: &[ArgumentType] =
             &[ArgumentType::Uint, ArgumentType::Str, ArgumentType::Uint];
-        static GLOBAL_REMOVE: &'static [ArgumentType] = &[ArgumentType::Uint];
+        static GLOBAL_REMOVE: &[ArgumentType] = &[ArgumentType::Uint];
         static REGISTRY_EVENTS: phf::Map<u16, &[ArgumentType]> = phf_map! {
             0u16 => GLOBAL,
             1u16 => GLOBAL_REMOVE,
         };
-        return &REGISTRY_EVENTS;
+        &REGISTRY_EVENTS
     }
 }

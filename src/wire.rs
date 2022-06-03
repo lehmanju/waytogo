@@ -267,7 +267,7 @@ impl WlSocket {
             let remaining_bytes = header.message_size as usize - HEADER_LEN;
             if self.read_buffer.remaining() < remaining_bytes {
                 self.header = Some(header);
-                return Ok(None);
+                Ok(None)
             } else {
                 // complete message in buffer
                 let args = self.read_buffer.copy_to_bytes(remaining_bytes);
@@ -367,13 +367,13 @@ impl WlSocket {
                 }
                 Argument::Object(val) => argument_bytes.put_u32_ne(val),
                 Argument::NewId(val) => argument_bytes.put_u32_ne(val),
-                Argument::Array(val) => todo!(),
+                Argument::Array(_val) => todo!(),
                 Argument::Fd(val) => fds.push(val),
             }
         }
 
         self.write_buffer.put_u32_ne(msg.sender_id);
-        let val = (argument_bytes.len() + 8 << 16u16) as u32 | msg.opcode as u32;
+        let val = ((argument_bytes.len() + 8) << 16u16) as u32 | msg.opcode as u32;
         self.write_buffer.put_u32_ne(val);
         self.write_buffer.put_slice(argument_bytes);
         argument_bytes.clear();

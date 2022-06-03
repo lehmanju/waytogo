@@ -1,32 +1,18 @@
 use std::{
     collections::HashMap,
     env, io,
-    os::unix::{net::UnixStream, prelude::AsRawFd},
+    os::unix::net::UnixStream,
     path::PathBuf,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc, RwLock,
-    },
-    task::Poll,
+    sync::{Arc, RwLock},
 };
 
-use async_trait::async_trait;
-use futures::{ready, Sink, SinkExt, Stream, StreamExt};
-use phf::phf_map;
-use pin_project_lite::pin_project;
-use smallvec::smallvec;
-use tokio::select;
+use futures::{Sink, SinkExt};
+
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::{
-    codec::Framed,
-    sync::{PollSendError, PollSender},
-};
+use tokio_util::sync::PollSender;
 
-use crate::{
-    interfaces::{self, Registry},
-    wire::{ArgumentType, Message, Signature, WaylandError, WaylandInterface, WlObject, WlSocket},
-};
+use crate::wire::{Message, Signature, WaylandError, WaylandInterface, WlObject, WlSocket};
 use std::fmt::Debug;
 
 pub struct WaylandConnection {
@@ -129,7 +115,7 @@ impl WaylandConnection {
                     }
                     break;
                 }
-                WlConnectionMessage::Destroy(sink) => todo!(),
+                WlConnectionMessage::Destroy(_sink) => todo!(),
                 WlConnectionMessage::Message(message) => {
                     self.socket.write_message(message).await.unwrap();
                     if let Some(msg) = msg_b.take() {

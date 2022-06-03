@@ -35,8 +35,6 @@ pub trait BufExt: Buf {
 impl<T> BufExt for T where T: Buf {}
 
 mod tests {
-    use bytes::{Buf, BufMut, BytesMut};
-
     use crate::{
         connection::WaylandConnection,
         interfaces::{GetRegistryRequest, WlDisplay},
@@ -57,14 +55,5 @@ mod tests {
                 None => break,
             }
         }
-    }
-
-    #[test]
-    fn test_shift() {
-        println!("result: {}", ((12u32 << 16) | u32::from(1u16)));
-        let mut bytes = BytesMut::new();
-        bytes.put_u16(12u16);
-        bytes.put_u16(1u16);
-        println!("bytes: {}", bytes.get_u32());
     }
 }
