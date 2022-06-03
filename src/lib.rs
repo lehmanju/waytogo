@@ -1,6 +1,7 @@
 use bytes::{Buf, BufMut};
 
 pub mod connection;
+pub mod interfaces;
 pub mod wire;
 
 pub trait BufMutExt: BufMut {
@@ -36,21 +37,26 @@ impl<T> BufExt for T where T: Buf {}
 mod tests {
     use bytes::{Buf, BufMut, BytesMut};
 
-    use crate::connection::WaylandConnection;
+    use crate::{
+        connection::WaylandConnection,
+        interfaces::{GetRegistryRequest, WlDisplay},
+    };
 
     #[tokio::test]
     async fn test_registry() {
         let mut conn = WaylandConnection::new().unwrap();
-        let mut registry = conn.setup().await.unwrap();
+        let mut display = conn.setup(WlDisplay {}).await;
+        tokio::spawn(conn.run());
+        let get_registry = GetRegistryRequest {};
+        let mut registry = display.send_request(get_registry).await.unwrap().unwrap();
         loop {
             match registry.next_message().await.unwrap() {
                 Some(registry_event) => {
                     println!("Received registry event: {:?}", registry_event)
-                },
+                }
                 None => break,
             }
         }
-        conn.run().await
     }
 
     #[test]

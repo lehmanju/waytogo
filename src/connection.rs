@@ -31,7 +31,7 @@ use std::fmt::Debug;
 
 pub struct WaylandConnection {
     socket: WlSocket,
-    objects: HashMap<u32, Box<dyn Sink<Message, Error = WaylandError> + Unpin + Send>>,
+    objects: HashMap<u32, Box<dyn WlSink>>,
     interfaces: HashMap<u32, Signature>,
     id_counter: Arc<RwLock<u32>>,
     requests_rx: Receiver<WlConnectionMessage>,
@@ -43,6 +43,7 @@ pub enum WlConnectionMessage {
     Create(u32, Signature, Box<dyn WlSink>),
     Destroy(u32),
     Message(Message),
+    Combined(Box<WlConnectionMessage>, Box<WlConnectionMessage>),
 }
 
 pub trait WlSink: Sink<Message, Error = WaylandError> + Unpin + Send + Debug {}
@@ -66,7 +67,7 @@ impl WaylandConnection {
             socket,
             objects: HashMap::new(),
             interfaces: HashMap::new(),
-            id_counter: Arc::new(RwLock::new(1)),
+            id_counter: Arc::new(RwLock::new(0)),
             requests_rx: rx,
             requests_tx: tx,
         })
@@ -75,9 +76,10 @@ impl WaylandConnection {
         &mut self,
         interface: D,
     ) -> WlObject<PollSender<WlConnectionMessage>, ReceiverStream<Message>, D> {
-        if *self.id_counter.try_read().unwrap() != 1u32 {
+        if *self.id_counter.read().unwrap() != 0u32 {
             panic!("setup can only be called once")
         }
+        *self.id_counter.write().unwrap() += 1;
         let (sender, receiver) = channel::<Message>(10);
         let sender_sink = PollSender::new(sender);
         let receiver_stream = ReceiverStream::new(receiver);
@@ -110,16 +112,36 @@ impl WaylandConnection {
 
     async fn read(&mut self, incoming: Result<Message, WaylandError>) {
         let message = incoming.unwrap();
-        let mut sink = self.objects.remove(&message.sender_id).unwrap();
+        let sink = self.objects.get_mut(&message.sender_id).unwrap();
         sink.send(message).await.unwrap();
     }
 
-    async fn write(&mut self, outgoing: Option<WlConnectionMessage>) {
-        match outgoing.unwrap() {
-            WlConnectionMessage::Create(id, signature, sink) => todo!(),
-            WlConnectionMessage::Destroy(sink) => todo!(),
-            WlConnectionMessage::Message(message) => {
-                self.socket.write_message(message).await.unwrap()
+    async fn write(&mut self, mut outgoing: Option<WlConnectionMessage>) {
+        let mut msg_b = None;
+        loop {
+            match outgoing.take().unwrap() {
+                WlConnectionMessage::Create(id, signature, sink) => {
+                    self.objects.insert(id, Box::new(sink));
+                    self.interfaces.insert(id, signature);
+                    if let Some(msg) = msg_b.take() {
+                        outgoing = Some(msg);
+                        continue;
+                    }
+                    break;
+                }
+                WlConnectionMessage::Destroy(sink) => todo!(),
+                WlConnectionMessage::Message(message) => {
+                    self.socket.write_message(message).await.unwrap();
+                    if let Some(msg) = msg_b.take() {
+                        outgoing = Some(msg);
+                        continue;
+                    }
+                    break;
+                }
+                WlConnectionMessage::Combined(a, b) => {
+                    outgoing = Some(*a);
+                    msg_b = Some(*b);
+                }
             }
         }
     }

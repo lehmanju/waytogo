@@ -134,7 +134,12 @@ pub trait RequestWithReturn {
     type ReturnType: WaylandInterface;
     /// Apply this request to `interface`.
     /// Returns optionally a new Wayland interface for a new object and a Wayland message.
-    fn apply(self, interface: &mut Self::Interface) -> (Option<Self::ReturnType>, Message);
+    fn apply(
+        self,
+        self_id: u32,
+        interface: &mut Self::Interface,
+        new_id: u32,
+    ) -> (Option<Self::ReturnType>, Message);
 }
 
 pub trait WaylandInterface {
@@ -184,34 +189,36 @@ where
         &mut self,
         request: Req,
     ) -> Result<Option<WlObject<T, ReceiverStream<Message>, Req::ReturnType>>, WaylandError> {
-        let (return_value, request_message) = request.apply(&mut self.data);
+        let mut guard = self.id_counter.write().unwrap();
+        let id = *guard + 1;
+        let (return_value, request_message) = request.apply(self.id, &mut self.data, id);
         match return_value {
             Some(new_object) => {
                 let (sender, receiver) = channel::<Message>(10);
                 let sender_sink = Box::new(PollSender::new(sender).sink_err_into());
                 let receiver_stream = ReceiverStream::new(receiver);
-                let mut guard = self.id_counter.write().unwrap();
                 *guard += 1;
+                drop(guard);
                 let object = WlObject {
                     id_counter: self.id_counter.clone(),
-                    id: *guard,
+                    id,
                     request_tx: self.request_tx.clone(),
                     message_rx: receiver_stream,
                     data: new_object,
                 };
-                self.request_tx
-                    .send(WlConnectionMessage::Create(
-                        *guard,
+                let msg = WlConnectionMessage::Combined(
+                    Box::new(WlConnectionMessage::Create(
+                        id,
                         Req::ReturnType::signature(),
                         sender_sink,
-                    ))
-                    .await?;
-                self.request_tx
-                    .send(WlConnectionMessage::Message(request_message))
-                    .await?;
+                    )),
+                    Box::new(WlConnectionMessage::Message(request_message)),
+                );
+                self.request_tx.send(msg).await?;
                 Ok(Some(object))
             }
             None => {
+                drop(guard);
                 self.request_tx
                     .send(WlConnectionMessage::Message(request_message))
                     .await?;
