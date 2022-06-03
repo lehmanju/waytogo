@@ -19,9 +19,10 @@ use pin_project_lite::pin_project;
 use smallvec::SmallVec;
 use thiserror::Error;
 use tokio::io::unix::{AsyncFd, TryIoError};
+use tokio_stream::StreamExt;
 use tokio_util::sync::PollSendError;
 
-use crate::{BufExt, BufMutExt};
+use crate::{BufExt, BufMutExt, connection::WlConnectionMessage};
 
 #[derive(Debug, Clone)]
 pub struct Header {
@@ -129,117 +130,31 @@ pub trait WaylandInterface {
     /// Map a request from this interface to a wayland request.
     ///
     /// The request is then sent directly to the socket.
-    fn request(&mut self, request: Self::Request) -> Result<Option<Message>, WaylandError>;
+    fn request(&mut self, request: Self::Request) -> Result<Option<WlConnectionMessage>, WaylandError>;
 }
 
-pin_project! {
-    #[project=Proj]
-    pub struct WlObject<T: Sink<Message>, R: Stream<Item = Message>, D: WaylandInterface> {
-        pub id_counter: Arc<AtomicU32>,
-        pub id: u32,
-        #[pin]
-        pub request_tx: T,
-        #[pin]
-        pub message_rx: R,
-        pub data: D,
-    }
+pub struct WlObject<T: Sink<WlConnectionMessage>, R: Stream<Item = Message> + Unpin, D: WaylandInterface> {
+    pub id_counter: Arc<AtomicU32>,
+    pub id: u32,
+    pub request_tx: T,
+    pub message_rx: R,
+    pub data: D,
 }
 
-impl<T, R, D> Stream for WlObject<T, R, D>
-where
-    T: Sink<Message>,
-    R: Stream<Item = Message>,
-    D: WaylandInterface,
-{
-    type Item = Result<D::Event, WaylandError>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let Proj {
-            id_counter: _,
-            id,
-            request_tx: _,
-            mut message_rx,
-            data,
-        } = self.project();
-        match message_rx.as_mut().poll_next(cx) {
-            Poll::Ready(value) => match value {
-                Some(message) => {
-                    assert_eq!(*id, message.sender_id);
-                    match data.process(message)? {
-                        Some(event) => Poll::Ready(Some(Ok(event))),
-                        None => Poll::Pending,
-                    }
-                }
-                None => Poll::Pending,
-            },
-            Poll::Pending => Poll::Pending,
+impl<T: Sink<WlConnectionMessage>, R: Stream<Item = Message> + Unpin, D: WaylandInterface> WlObject<T, R, D> {
+    pub async fn next_message(&mut self) -> Result<Option<D::Event>, WaylandError> {
+        loop {
+            match self.message_rx.next().await {
+                Some(message) => match self.data.process(message)? {
+                    Some(event) => return Ok(Some(event)),
+                    None => continue,
+                },
+                None => return Ok(None),
+            };
         }
     }
-}
-
-impl<T, R, D> Sink<Message> for WlObject<T, R, D>
-where
-    T: Sink<Message, Error = WaylandError>,
-    R: Stream<Item = Message>,
-    D: WaylandInterface,
-{
-    type Error = WaylandError;
-
-    fn poll_ready(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        let Proj {
-            id_counter: _,
-            id: _,
-            request_tx,
-            message_rx: _,
-            data: _,
-        } = self.project();
-        request_tx.poll_ready(cx)
-    }
-
-    fn start_send(self: std::pin::Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
-        let Proj {
-            id_counter: _,
-            id,
-            request_tx,
-            message_rx: _,
-            data: _,
-        } = self.project();
-        assert_eq!(*id, item.sender_id);
-        request_tx.start_send(item)
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        let Proj {
-            id_counter: _,
-            id: _,
-            request_tx,
-            message_rx: _,
-            data: _,
-        } = self.project();
-        request_tx.poll_flush(cx)
-    }
-
-    fn poll_close(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        let Proj {
-            id_counter: _,
-            id: _,
-            request_tx,
-            message_rx: _,
-            data: _,
-        } = self.project();
-        request_tx.poll_close(cx)
+    pub async fn send_request(&mut self, request: D::Request) -> Result<(), T::Error> {
+        todo!()
     }
 }
 

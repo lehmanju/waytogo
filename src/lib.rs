@@ -41,7 +41,15 @@ mod tests {
     #[tokio::test]
     async fn test_registry() {
         let mut conn = WaylandConnection::new().unwrap();
-        let registry = conn.setup().await.unwrap();
+        let mut registry = conn.setup().await.unwrap();
+        loop {
+            match registry.next_message().await.unwrap() {
+                Some(registry_event) => {
+                    println!("Received registry event: {:?}", registry_event)
+                },
+                None => break,
+            }
+        }
         conn.run().await
     }
 

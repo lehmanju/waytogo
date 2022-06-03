@@ -30,8 +30,19 @@ pub struct WaylandConnection {
     interfaces: HashMap<u32, &'static phf::Map<u16, &'static [ArgumentType]>>,
     id_counter: Arc<AtomicU32>,
     //TODO use channels without Arc because its single-threaded
-    requests_rx: Receiver<Message>,
-    requests_tx: Sender<Message>,
+    requests_rx: Receiver<WlConnectionMessage>,
+    requests_tx: Sender<WlConnectionMessage>,
+}
+
+pub struct WlConnectionMessage {
+    message: Message,
+    flags: WlConnectionFlags,
+}
+
+pub enum WlConnectionFlags {
+    Create,
+    Destroy,
+    Message
 }
 
 impl WaylandConnection {
@@ -40,13 +51,13 @@ impl WaylandConnection {
         let xdg_dir = env::var_os("XDG_RUNTIME_DIR").unwrap();
         let wayland_display = env::var_os("WAYLAND_DISPLAY").unwrap();
         let mut path: PathBuf = xdg_dir.into();
-        //path.push(wayland_display);
+        path.push(wayland_display);
         //path.push("wldbg-wayland-0");
-        path.push("wayland-0");
+        //path.push("wayland-0");
         dbg!(&path);
         let stream = UnixStream::connect(path)?;
         let socket = WlSocket::new(stream)?;
-        let (tx, rx) = channel::<Message>(100);
+        let (tx, rx) = channel::<WlConnectionMessage>(100);
         Ok(Self {
             socket,
             objects: HashMap::new(),
@@ -87,7 +98,7 @@ impl WaylandConnection {
             tokio::select! {
                 incoming = self.socket.read_message(&self.interfaces) => {
                     let message = incoming.unwrap();
-                    let sink = self.objects.get_mut(&message.sender_id).unwrap();
+                    let mut sink = self.objects.remove(&message.sender_id).unwrap();
                     sink.send(message).await.unwrap();
                 }
                 outgoing = self.requests_rx.recv() => {
@@ -103,17 +114,20 @@ impl WaylandConnection {
 }
 pub type Registry = WlObject<PollSender<Message>, ReceiverStream<Message>, WlRegistry>;
 
+#[derive(Debug)]
 pub enum RegistryEvent {
     Global(GlobalEvent),
     GlobalRemove(GlobalRemoveEvent),
 }
 
+#[derive(Debug)]
 pub struct GlobalEvent {
     name: u32,
     interface: String,
     version: u32,
 }
 
+#[derive(Debug)]
 pub struct GlobalRemoveEvent {
     name: u32,
 }
