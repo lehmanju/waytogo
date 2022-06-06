@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    ffi::{CStr, CString},
     hash::Hash,
     marker::PhantomData,
 };
@@ -130,6 +131,14 @@ impl WaylandInterface for WlDisplay {
         const GET_REGISTRY: &[ArgumentType] = &[ArgumentType::NewId];
         &[SYNC, GET_REGISTRY]
     }
+
+    fn interface() -> &'static str {
+        todo!()
+    }
+
+    fn version() -> u32 {
+        todo!()
+    }
 }
 
 #[derive(Debug)]
@@ -166,7 +175,12 @@ impl<T: WaylandInterface> RequestObject for BindRequest<T> {
             let message = Message {
                 sender_id: self_id,
                 opcode: 0,
-                args: smallvec![Argument::Uint(self.name), Argument::NewId(self.id)],
+                args: smallvec![
+                    Argument::Uint(self.name),
+                    Argument::Str(Box::new(CString::new(T::interface()).unwrap())),
+                    Argument::Uint(T::version()),
+                    Argument::NewId(self.id)
+                ],
             };
             return (self.interface, message);
         }
@@ -265,7 +279,40 @@ impl WaylandInterface for WlRegistry {
     }
 
     fn request_signature() -> Signature {
-        const BIND: &[ArgumentType] = &[ArgumentType::Uint, ArgumentType::NewId];
+        const BIND: &[ArgumentType] = &[
+            ArgumentType::Uint,
+            ArgumentType::Str,
+            ArgumentType::Uint,
+            ArgumentType::NewId,
+        ];
         &[BIND]
+    }
+
+    fn interface() -> &'static str {
+        todo!()
+    }
+
+    fn version() -> u32 {
+        todo!()
+    }
+}
+
+pub struct WlShm;
+
+impl WaylandInterface for WlShm {
+    fn event_signature() -> Signature {
+        const FORMAT: &[ArgumentType] = &[ArgumentType::Uint];
+        &[FORMAT]
+    }
+    fn request_signature() -> Signature {
+        &[]
+    }
+
+    fn interface() -> &'static str {
+        "wl_shm"
+    }
+
+    fn version() -> u32 {
+        1
     }
 }

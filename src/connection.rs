@@ -75,8 +75,9 @@ impl WaylandConnection {
         let (sender, receiver) = channel::<Message>(10);
         let sender_sink = PollSender::new(sender);
         let receiver_stream = ReceiverStream::new(receiver);
-        let request_sink =
-            PollSender::new(self.requests_tx.clone()).sink_map_err(Into::<WaylandError>::into as fn(PollSendError<WlConnectionMessage>) -> WaylandError);
+        let request_sink = PollSender::new(self.requests_tx.clone()).sink_map_err(
+            Into::<WaylandError>::into as fn(PollSendError<WlConnectionMessage>) -> WaylandError,
+        );
         let signature = D::event_signature();
         let registry = WlObject {
             id_counter: self.id_counter.clone(),
@@ -104,6 +105,9 @@ impl WaylandConnection {
     }
 
     async fn read(&mut self, incoming: Result<Message, WaylandError>) {
+        if incoming.is_err() {
+            println!("error message read");
+        }
         let message = incoming.unwrap();
         match self.objects.remove(&message.sender_id) {
             Some(mut sink) => {

@@ -15,7 +15,10 @@ use futures::{executor::block_on, Sink, SinkExt, Stream};
 use nix::{cmsg_space, errno::Errno, sys::socket};
 use smallvec::SmallVec;
 use thiserror::Error;
-use tokio::{io::unix::AsyncFd, sync::mpsc::channel};
+use tokio::{
+    io::unix::{AsyncFd, TryIoError},
+    sync::mpsc::channel,
+};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tokio_util::sync::{PollSendError, PollSender};
 
@@ -193,6 +196,8 @@ pub enum Processed<T> {
 pub trait WaylandInterface {
     fn event_signature() -> Signature;
     fn request_signature() -> Signature;
+    fn interface() -> &'static str;
+    fn version() -> u32;
     fn destroy(&mut self, self_id: u32) -> Option<Message> {
         None
     }
@@ -396,8 +401,12 @@ impl WlSocket {
                     ArgumentType::Uint => Argument::Uint(raw_message.args.get_u32_ne()),
                     ArgumentType::Fixed => Argument::Fixed(raw_message.args.get_i32_ne()),
                     ArgumentType::Str => {
-                        let string_length = raw_message.args.get_u32_ne() - 1;
-                        let string_bytes = raw_message.args.copy_to_bytes(string_length as usize);
+                        let string_length = raw_message.args.get_u32_ne();
+                        let string_bytes =
+                            raw_message.args.copy_to_bytes((string_length - 1) as usize);
+                        raw_message
+                            .args
+                            .advance(1 + ((4 - (string_length % 4)) % 4) as usize);
                         let string = CString::new(string_bytes.to_vec()).unwrap();
                         Argument::Str(Box::new(string))
                     }
@@ -427,6 +436,7 @@ impl WlSocket {
             Ok(Some(result_message))
         } else {
             self.unprocessed_msg = self.decode_raw()?;
+            //println!("decoded raw message {:?}", self.unprocessed_msg);
             if self.unprocessed_msg.is_none() {
                 return Ok(None);
             }
@@ -443,9 +453,12 @@ impl WlSocket {
                 Argument::Int(val) => argument_bytes.put_i32_ne(val),
                 Argument::Fixed(val) => argument_bytes.put_i32_ne(val),
                 Argument::Str(val) => {
-                    let bytes = val.as_bytes();
-                    argument_bytes.put_u32_ne(bytes.len() as u32);
+                    let bytes = val.as_bytes_with_nul();
+                    let len = bytes.len() as u32;
+                    argument_bytes.put_u32_ne(len);
                     argument_bytes.put_slice(bytes);
+                    let pad = 4 - (len % 4);
+                    argument_bytes.put_bytes(0, pad as usize);
                 }
                 Argument::Object(val) => argument_bytes.put_u32_ne(val),
                 Argument::NewId(val) => argument_bytes.put_u32_ne(val),
