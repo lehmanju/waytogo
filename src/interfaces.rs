@@ -1,59 +1,136 @@
+use std::{
+    collections::{HashMap, HashSet},
+    hash::Hash,
+    marker::PhantomData,
+};
+
 use phf::phf_map;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::PollSender;
 
 use crate::wire::{
-    Argument, ArgumentType, Message, RequestWithReturn, WaylandError, WaylandInterface, WlObject,
+    Argument, ArgumentType, Event, Message, Processed, RequestObject, Signature, WaylandError,
+    WaylandInterface, WlObject,
 };
 
 use smallvec::smallvec;
 
 pub struct WlDisplay {}
 
-pub enum DisplayEvent {}
+pub struct ErrorEvent {
+    pub object_id: u32,
+    pub code: u32,
+    pub message: String,
+}
 
-pub struct GetRegistryRequest {}
+pub struct DeleteIdEvent {
+    pub id: u32,
+}
 
-impl RequestWithReturn for GetRegistryRequest {
+pub struct GetRegistryRequest {
+    pub registry: u32,
+}
+
+pub struct SyncRequest {
+    pub callback: u32,
+}
+
+/*
+
+impl RequestObject for SyncRequest {
+    type Interface = WlDisplay;
+    type ReturnType = WlCallback;
+
+    fn apply(self, self_id: u32, interface: &mut Self::Interface) -> (Self::ReturnType, Message) {
+        todo!()
+    }
+
+    fn id(&self) -> u32 {
+        todo!()
+    }
+}
+
+*/
+
+impl RequestObject for GetRegistryRequest {
     type Interface = WlDisplay;
     type ReturnType = WlRegistry;
 
-    fn apply(
-        self,
-        self_id: u32,
-        _interface: &mut Self::Interface,
-        new_id: u32,
-    ) -> (Option<Self::ReturnType>, Message) {
-        let args = smallvec![Argument::NewId(new_id)];
+    fn apply(self, self_id: u32, _interface: &mut Self::Interface) -> (Self::ReturnType, Message) {
+        let args = smallvec![Argument::NewId(self.registry)];
         let message = Message {
             sender_id: self_id,
             opcode: 1,
             args,
         };
-        (Some(WlRegistry {}), message)
+        (
+            WlRegistry {
+                name_id_map: HashMap::new(),
+                available_names: HashSet::new(),
+            },
+            message,
+        )
+    }
+
+    fn id(&self) -> u32 {
+        self.registry
+    }
+}
+
+impl Event for ErrorEvent {
+    type Interface = WlDisplay;
+
+    fn apply(
+        mut message: Message,
+        interface: &mut Self::Interface,
+    ) -> Result<Processed<Self>, WaylandError> {
+        let mut drain_iter = message.args.drain(..);
+        let object_id = drain_iter.next().unwrap().into_object().unwrap();
+        let code = drain_iter.next().unwrap().into_uint().unwrap();
+        let message = drain_iter
+            .next()
+            .unwrap()
+            .into_str()
+            .unwrap()
+            .into_string()
+            .unwrap();
+
+        Ok(Processed::Event(Self {
+            object_id,
+            code,
+            message,
+        }))
+    }
+}
+
+impl Event for DeleteIdEvent {
+    type Interface = WlDisplay;
+
+    fn apply(
+        mut message: Message,
+        interface: &mut Self::Interface,
+    ) -> Result<Processed<Self>, WaylandError> {
+        let mut drain_iter = message.args.drain(..);
+        let id = drain_iter.next().unwrap().into_uint().unwrap();
+        Ok(Processed::Event(DeleteIdEvent { id }))
     }
 }
 
 impl WaylandInterface for WlDisplay {
-    type Event = DisplayEvent;
-
-    fn process(&mut self, _message: Message) -> Result<Option<Self::Event>, WaylandError> {
-        todo!()
-    }
-
-    fn signature() -> &'static phf::Map<u16, &'static [ArgumentType]> {
-        static ERROR: &[ArgumentType] =
+    fn event_signature() -> Signature {
+        const ERROR: &[ArgumentType] =
             &[ArgumentType::Object, ArgumentType::Uint, ArgumentType::Str];
-        static DELETE_ID: &[ArgumentType] = &[ArgumentType::Uint];
-        static DISPLAY_EVENTS: phf::Map<u16, &[ArgumentType]> = phf_map! {
-            0u16 => ERROR,
-            1u16 => DELETE_ID,
-        };
+        const DELETE_ID: &[ArgumentType] = &[ArgumentType::Uint];
+        const DISPLAY_EVENTS: Signature = &[ERROR, DELETE_ID];
         &DISPLAY_EVENTS
     }
-}
 
-pub type Registry = WlObject<PollSender<Message>, ReceiverStream<Message>, WlRegistry>;
+    fn request_signature() -> Signature {
+        const SYNC: &[ArgumentType] = &[ArgumentType::NewId];
+        const GET_REGISTRY: &[ArgumentType] = &[ArgumentType::NewId];
+        &[SYNC, GET_REGISTRY]
+    }
+}
 
 #[derive(Debug)]
 pub enum RegistryEvent {
@@ -63,52 +140,132 @@ pub enum RegistryEvent {
 
 #[derive(Debug)]
 pub struct GlobalEvent {
-    name: u32,
-    interface: String,
-    version: u32,
+    pub name: u32,
+    pub interface: String,
+    pub version: u32,
 }
 
 #[derive(Debug)]
 pub struct GlobalRemoveEvent {
-    name: u32,
+    pub name: u32,
 }
 
-pub struct WlRegistry {}
+pub struct BindRequest<T> {
+    pub interface: T,
+    pub name: u32,
+    pub id: u32,
+}
 
-impl WaylandInterface for WlRegistry {
-    type Event = RegistryEvent;
+impl<T: WaylandInterface> RequestObject for BindRequest<T> {
+    type Interface = WlRegistry;
+    type ReturnType = T;
 
-    fn process(&mut self, mut message: Message) -> Result<Option<Self::Event>, WaylandError> {
+    fn apply(self, self_id: u32, interface: &mut Self::Interface) -> (Self::ReturnType, Message) {
+        if interface.available_names.contains(&self.name) {
+            interface.name_id_map.insert(self.name, self.id);
+            let message = Message {
+                sender_id: self_id,
+                opcode: 0,
+                args: smallvec![Argument::Uint(self.name), Argument::NewId(self.id)],
+            };
+            return (self.interface, message);
+        }
+        panic!("Invalid object name")
+    }
+
+    fn id(&self) -> u32 {
+        self.id
+    }
+}
+
+impl Event for GlobalEvent {
+    type Interface = WlRegistry;
+
+    fn apply(
+        mut message: Message,
+        interface: &mut Self::Interface,
+    ) -> Result<Processed<Self>, WaylandError> {
+        let mut drain_iter = message.args.drain(..);
+        let name = drain_iter.next().unwrap().into_uint().unwrap();
+        let interface_name: String = drain_iter
+            .next()
+            .unwrap()
+            .into_str()
+            .unwrap()
+            .into_string()?;
+        let version = drain_iter.next().unwrap().into_uint().unwrap();
+
+        interface.available_names.insert(name);
+
+        Ok(Processed::Event(GlobalEvent {
+            name,
+            interface: interface_name,
+            version,
+        }))
+    }
+}
+
+impl Event for GlobalRemoveEvent {
+    type Interface = WlRegistry;
+
+    fn apply(
+        mut message: Message,
+        interface: &mut Self::Interface,
+    ) -> Result<Processed<Self>, WaylandError> {
+        let mut drain_iter = message.args.drain(..);
+        let name = drain_iter.next().unwrap().into_uint().unwrap();
+        let is_mapped = interface.name_id_map.contains_key(&name);
+        interface.available_names.remove(&name);
+        if is_mapped {
+            let id = interface.name_id_map.remove(&name).unwrap();
+            return Ok(Processed::Destroy(id, GlobalRemoveEvent { name }));
+        }
+
+        Ok(Processed::Event(GlobalRemoveEvent { name }))
+    }
+}
+
+impl Event for RegistryEvent {
+    type Interface = WlRegistry;
+
+    fn apply(
+        message: Message,
+        interface: &mut Self::Interface,
+    ) -> Result<Processed<Self>, WaylandError> {
         match message.opcode {
-            0 => {
-                let name = message.args.remove(0).into_uint().unwrap();
-                let interface: String = message.args.remove(0).into_str().unwrap().into_string()?;
-                let version = message.args.remove(0).into_uint().unwrap();
-                Ok(Some(RegistryEvent::Global(GlobalEvent {
-                    name,
-                    interface,
-                    version,
-                })))
-            }
-            1 => {
-                let name = message.args.pop().unwrap().into_uint().unwrap();
-
-                Ok(Some(RegistryEvent::GlobalRemove(GlobalRemoveEvent {
-                    name,
-                })))
-            }
+            0 => GlobalEvent::apply(message, interface).map(|val| match val {
+                Processed::Event(event) => Processed::Event(Self::Global(event)),
+                Processed::Destroyed(event) => Processed::Destroyed(Self::Global(event)),
+                Processed::Destroy(id, event) => Processed::Destroy(id, Self::Global(event)),
+                Processed::None => Processed::None,
+            }),
+            1 => GlobalRemoveEvent::apply(message, interface).map(|val| match val {
+                Processed::Event(event) => Processed::Event(Self::GlobalRemove(event)),
+                Processed::Destroyed(event) => Processed::Destroyed(Self::GlobalRemove(event)),
+                Processed::Destroy(id, event) => Processed::Destroy(id, Self::GlobalRemove(event)),
+                Processed::None => Processed::None,
+            }),
             _ => Err(WaylandError::UnknownOpcode(message.opcode)),
         }
     }
+}
 
-    fn signature() -> &'static phf::Map<u16, &'static [ArgumentType]> {
-        static GLOBAL: &[ArgumentType] =
+pub struct WlRegistry {
+    name_id_map: HashMap<u32, u32>,
+    available_names: HashSet<u32>,
+}
+
+impl WaylandInterface for WlRegistry {
+    fn event_signature() -> Signature {
+        const GLOBAL: &[ArgumentType] =
             &[ArgumentType::Uint, ArgumentType::Str, ArgumentType::Uint];
-        static GLOBAL_REMOVE: &[ArgumentType] = &[ArgumentType::Uint];
-        static REGISTRY_EVENTS: phf::Map<u16, &[ArgumentType]> = phf_map! {
-            0u16 => GLOBAL,
-            1u16 => GLOBAL_REMOVE,
-        };
+        const GLOBAL_REMOVE: &[ArgumentType] = &[ArgumentType::Uint];
+        const REGISTRY_EVENTS: Signature = &[GLOBAL, GLOBAL_REMOVE];
         &REGISTRY_EVENTS
+    }
+
+    fn request_signature() -> Signature {
+        const BIND: &[ArgumentType] = &[ArgumentType::Uint, ArgumentType::NewId];
+        &[BIND]
     }
 }

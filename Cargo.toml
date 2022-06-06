@@ -18,6 +18,6 @@ thiserror = "1.0"
 futures = "0.3"
 pin-project-lite = "0.2"
 async-trait = "*"
-enum-as-inner = "*"
+enum-as-inner = "0.5"
 nix = { version = "0.24", features = ["uio", "socket"] }
 phf = { version = "0.10", features = ["macros"] }

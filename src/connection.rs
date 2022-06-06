@@ -6,11 +6,11 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use futures::{Sink, SinkExt};
+use futures::{sink::SinkMapErr, Sink, SinkExt};
 
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::sync::PollSender;
+use tokio_util::sync::{PollSendError, PollSender};
 
 use crate::wire::{Message, Signature, WaylandError, WaylandInterface, WlObject, WlSocket};
 use std::fmt::Debug;
@@ -29,7 +29,6 @@ pub enum WlConnectionMessage {
     Create(u32, Signature, Box<dyn WlSink>),
     Destroy(u32),
     Message(Message),
-    Combined(Box<WlConnectionMessage>, Box<WlConnectionMessage>),
 }
 
 pub trait WlSink: Sink<Message, Error = WaylandError> + Unpin + Send + Debug {}
@@ -61,7 +60,14 @@ impl WaylandConnection {
     pub async fn setup<D: WaylandInterface>(
         &mut self,
         interface: D,
-    ) -> WlObject<PollSender<WlConnectionMessage>, ReceiverStream<Message>, D> {
+    ) -> WlObject<
+        SinkMapErr<
+            PollSender<WlConnectionMessage>,
+            fn(PollSendError<WlConnectionMessage>) -> WaylandError,
+        >,
+        ReceiverStream<Message>,
+        D,
+    > {
         if *self.id_counter.read().unwrap() != 0u32 {
             panic!("setup can only be called once")
         }
@@ -69,8 +75,9 @@ impl WaylandConnection {
         let (sender, receiver) = channel::<Message>(10);
         let sender_sink = PollSender::new(sender);
         let receiver_stream = ReceiverStream::new(receiver);
-        let request_sink = PollSender::new(self.requests_tx.clone());
-        let signature = D::signature();
+        let request_sink =
+            PollSender::new(self.requests_tx.clone()).sink_map_err(Into::<WaylandError>::into as fn(PollSendError<WlConnectionMessage>) -> WaylandError);
+        let signature = D::event_signature();
         let registry = WlObject {
             id_counter: self.id_counter.clone(),
             id: 1u32,
@@ -98,36 +105,29 @@ impl WaylandConnection {
 
     async fn read(&mut self, incoming: Result<Message, WaylandError>) {
         let message = incoming.unwrap();
-        let sink = self.objects.get_mut(&message.sender_id).unwrap();
-        sink.send(message).await.unwrap();
+        match self.objects.remove(&message.sender_id) {
+            Some(mut sink) => {
+                let id = message.sender_id;
+                if sink.send(message).await.is_ok() {
+                    self.objects.insert(id, sink);
+                }
+            }
+            None => println!("Missing object for id {}", message.sender_id),
+        }
     }
 
-    async fn write(&mut self, mut outgoing: Option<WlConnectionMessage>) {
-        let mut msg_b = None;
-        loop {
-            match outgoing.take().unwrap() {
-                WlConnectionMessage::Create(id, signature, sink) => {
-                    self.objects.insert(id, Box::new(sink));
-                    self.interfaces.insert(id, signature);
-                    if let Some(msg) = msg_b.take() {
-                        outgoing = Some(msg);
-                        continue;
-                    }
-                    break;
-                }
-                WlConnectionMessage::Destroy(_sink) => todo!(),
-                WlConnectionMessage::Message(message) => {
-                    self.socket.write_message(message).await.unwrap();
-                    if let Some(msg) = msg_b.take() {
-                        outgoing = Some(msg);
-                        continue;
-                    }
-                    break;
-                }
-                WlConnectionMessage::Combined(a, b) => {
-                    outgoing = Some(*a);
-                    msg_b = Some(*b);
-                }
+    async fn write(&mut self, outgoing: Option<WlConnectionMessage>) {
+        match outgoing.unwrap() {
+            WlConnectionMessage::Create(id, signature, sink) => {
+                self.objects.insert(id, Box::new(sink));
+                self.interfaces.insert(id, signature);
+            }
+            WlConnectionMessage::Destroy(id) => {
+                self.objects.remove(&id);
+                self.interfaces.remove(&id);
+            }
+            WlConnectionMessage::Message(message) => {
+                self.socket.write_message(message).await.unwrap();
             }
         }
     }

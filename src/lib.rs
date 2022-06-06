@@ -37,7 +37,8 @@ impl<T> BufExt for T where T: Buf {}
 mod tests {
     use crate::{
         connection::WaylandConnection,
-        interfaces::{GetRegistryRequest, WlDisplay},
+        interfaces::{BindRequest, GetRegistryRequest, WlDisplay, WlRegistry},
+        wire::{Request, WaylandInterface},
     };
 
     #[tokio::test]
@@ -45,12 +46,21 @@ mod tests {
         let mut conn = WaylandConnection::new().unwrap();
         let mut display = conn.setup(WlDisplay {}).await;
         tokio::spawn(conn.run());
-        let get_registry = GetRegistryRequest {};
-        let mut registry = display.send_request(get_registry).await.unwrap().unwrap();
+        let new_id = display.get_new_id().unwrap();
+        let get_registry = GetRegistryRequest { registry: new_id };
+        let mut registry = display.request_object(get_registry).await.unwrap();
         loop {
-            match registry.next_message().await.unwrap() {
+            match registry.next_event().await.unwrap() {
                 Some(registry_event) => {
-                    println!("Received registry event: {:?}", registry_event)
+                    println!("Received registry event: {:?}", registry_event);
+                    match registry_event {
+                        crate::interfaces::RegistryEvent::Global(global) => {
+                            if global.interface == "wl_compositor" {
+                                println!("got compositor object")
+                            }
+                        }
+                        crate::interfaces::RegistryEvent::GlobalRemove(global_remove) => todo!(),
+                    }
                 }
                 None => break,
             }
