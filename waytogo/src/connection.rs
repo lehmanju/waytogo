@@ -1,10 +1,4 @@
-use std::{
-    collections::HashMap,
-    env, io,
-    os::unix::net::UnixStream,
-    path::PathBuf,
-    sync::{Arc, RwLock},
-};
+use std::{collections::HashMap, env, io, os::unix::net::UnixStream, path::PathBuf};
 
 use futures::{sink::SinkMapErr, Sink, SinkExt};
 
@@ -12,22 +6,26 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::{PollSendError, PollSender};
 
-use crate::wire::{Message, Signature, WaylandError, WaylandInterface, WlObject, WlSocket};
+use crate::wire::{
+    Id, IdRegistry, LookupId, Message, Signature, WaylandError, WaylandInterface, WlObject,
+    WlSocket,
+};
 use std::fmt::Debug;
 
 pub struct WaylandConnection {
     socket: WlSocket,
-    objects: HashMap<u32, Box<dyn WlSink>>,
-    interfaces: HashMap<u32, Signature>,
-    id_counter: Arc<RwLock<u32>>,
+    objects: HashMap<LookupId, Box<dyn WlSink>>,
+    interfaces: HashMap<LookupId, Signature>,
+    id_counter: IdRegistry,
     requests_rx: Receiver<WlConnectionMessage>,
     requests_tx: Sender<WlConnectionMessage>,
+    initial: Option<Id>,
 }
 
 #[derive(Debug)]
 pub enum WlConnectionMessage {
-    Create(u32, Signature, Box<dyn WlSink>),
-    Destroy(u32),
+    Create(LookupId, Signature, Box<dyn WlSink>),
+    Destroy(LookupId),
     Message(Message),
 }
 
@@ -45,16 +43,18 @@ impl WaylandConnection {
         //path.push("wldbg-wayland-0");
         //path.push("wayland-0");
         dbg!(&path);
+        let (idreg, initial) = IdRegistry::new();
         let stream = UnixStream::connect(path)?;
-        let socket = WlSocket::new(stream)?;
+        let socket = WlSocket::new(stream, idreg.clone())?;
         let (tx, rx) = channel::<WlConnectionMessage>(100);
         Ok(Self {
             socket,
             objects: HashMap::new(),
             interfaces: HashMap::new(),
-            id_counter: Arc::new(RwLock::new(0)),
+            id_counter: idreg,
             requests_rx: rx,
             requests_tx: tx,
+            initial: Some(initial),
         })
     }
     pub async fn setup<D: WaylandInterface>(
@@ -68,10 +68,11 @@ impl WaylandConnection {
         ReceiverStream<Message>,
         D,
     > {
-        if *self.id_counter.read().unwrap() != 0u32 {
+        if self.initial.is_none() {
             panic!("setup can only be called once")
         }
-        *self.id_counter.write().unwrap() += 1;
+        let id = self.initial.take().unwrap();
+        let lookup = id.get_lookup();
         let (sender, receiver) = channel::<Message>(10);
         let sender_sink = PollSender::new(sender);
         let receiver_stream = ReceiverStream::new(receiver);
@@ -79,16 +80,10 @@ impl WaylandConnection {
             Into::<WaylandError>::into as fn(PollSendError<WlConnectionMessage>) -> WaylandError,
         );
         let signature = D::event_signature();
-        let registry = WlObject {
-            id_counter: self.id_counter.clone(),
-            id: 1u32,
-            request_tx: request_sink,
-            message_rx: receiver_stream,
-            data: interface,
-        };
+        let registry = WlObject::new(id, request_sink, receiver_stream, interface);
         self.objects
-            .insert(1u32, Box::new(sender_sink.sink_err_into()));
-        self.interfaces.insert(1u32, signature);
+            .insert(lookup.clone(), Box::new(sender_sink.sink_err_into()));
+        self.interfaces.insert(lookup, signature);
         registry
     }
     pub async fn run(mut self) {
@@ -109,21 +104,21 @@ impl WaylandConnection {
             println!("error message read");
         }
         let message = incoming.unwrap();
-        match self.objects.remove(&message.sender_id) {
+        match self.objects.remove(&message.sender_id.get_lookup()) {
             Some(mut sink) => {
-                let id = message.sender_id;
+                let id = message.sender_id.get_lookup();
                 if sink.send(message).await.is_ok() {
                     self.objects.insert(id, sink);
                 }
             }
-            None => println!("Missing object for id {}", message.sender_id),
+            None => eprintln!("Missing object for id {:?}", message.sender_id),
         }
     }
 
     async fn write(&mut self, outgoing: Option<WlConnectionMessage>) {
         match outgoing.unwrap() {
             WlConnectionMessage::Create(id, signature, sink) => {
-                self.objects.insert(id, Box::new(sink));
+                self.objects.insert(id.clone(), Box::new(sink));
                 self.interfaces.insert(id, signature);
             }
             WlConnectionMessage::Destroy(id) => {

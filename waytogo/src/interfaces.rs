@@ -10,8 +10,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::PollSender;
 
 use crate::wire::{
-    Argument, ArgumentType, Event, Message, Processed, RequestObject, Signature, WaylandError,
-    WaylandInterface, WlObject,
+    Argument, ArgumentType, Event, Id, LookupId, Message, NewId, Processed, RequestObject,
+    Signature, WaylandError, WaylandInterface, WlObject,
 };
 
 use smallvec::smallvec;
@@ -29,7 +29,7 @@ pub struct DeleteIdEvent {
 }
 
 pub struct GetRegistryRequest {
-    pub registry: u32,
+    pub registry: NewId,
 }
 
 pub struct SyncRequest {
@@ -57,7 +57,7 @@ impl RequestObject for GetRegistryRequest {
     type Interface = WlDisplay;
     type ReturnType = WlRegistry;
 
-    fn apply(self, self_id: u32, _interface: &mut Self::Interface) -> (Self::ReturnType, Message) {
+    fn apply(self, self_id: Id, _interface: &mut Self::Interface) -> (Self::ReturnType, Message) {
         let args = smallvec![Argument::NewId(self.registry)];
         let message = Message {
             sender_id: self_id,
@@ -73,8 +73,8 @@ impl RequestObject for GetRegistryRequest {
         )
     }
 
-    fn id(&self) -> u32 {
-        self.registry
+    fn id(&self) -> &NewId {
+        &self.registry
     }
 }
 
@@ -141,6 +141,8 @@ impl WaylandInterface for WlDisplay {
     }
 }
 
+// Registry
+
 #[derive(Debug)]
 pub enum RegistryEvent {
     Global(GlobalEvent),
@@ -162,16 +164,18 @@ pub struct GlobalRemoveEvent {
 pub struct BindRequest<T> {
     pub interface: T,
     pub name: u32,
-    pub id: u32,
+    pub id: NewId,
 }
 
 impl<T: WaylandInterface> RequestObject for BindRequest<T> {
     type Interface = WlRegistry;
     type ReturnType = T;
 
-    fn apply(self, self_id: u32, interface: &mut Self::Interface) -> (Self::ReturnType, Message) {
+    fn apply(self, self_id: Id, interface: &mut Self::Interface) -> (Self::ReturnType, Message) {
         if interface.available_names.contains(&self.name) {
-            interface.name_id_map.insert(self.name, self.id);
+            interface
+                .name_id_map
+                .insert(self.name, self.id.get_lookup());
             let message = Message {
                 sender_id: self_id,
                 opcode: 0,
@@ -187,8 +191,8 @@ impl<T: WaylandInterface> RequestObject for BindRequest<T> {
         panic!("Invalid object name")
     }
 
-    fn id(&self) -> u32 {
-        self.id
+    fn id(&self) -> &NewId {
+        &self.id
     }
 }
 
@@ -265,7 +269,7 @@ impl Event for RegistryEvent {
 }
 
 pub struct WlRegistry {
-    name_id_map: HashMap<u32, u32>,
+    name_id_map: HashMap<u32, LookupId>,
     available_names: HashSet<u32>,
 }
 
@@ -296,6 +300,8 @@ impl WaylandInterface for WlRegistry {
         todo!()
     }
 }
+
+// Shm
 
 pub struct WlShm;
 

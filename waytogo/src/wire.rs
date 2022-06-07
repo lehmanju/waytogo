@@ -6,7 +6,8 @@ use std::{
         net::UnixStream,
         prelude::{AsRawFd, RawFd},
     },
-    sync::{Arc, PoisonError, RwLock, RwLockWriteGuard},
+    ptr,
+    sync::{Arc, Mutex},
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -14,17 +15,134 @@ use enum_as_inner::EnumAsInner;
 use futures::{executor::block_on, Sink, SinkExt, Stream};
 use nix::{cmsg_space, errno::Errno, sys::socket};
 use smallvec::SmallVec;
+use strum_macros::EnumDiscriminants;
 use thiserror::Error;
-use tokio::{
-    io::unix::{AsyncFd, TryIoError},
-    sync::mpsc::channel,
-};
+use tokio::{io::unix::AsyncFd, sync::mpsc::channel};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tokio_util::sync::{PollSendError, PollSender};
 
-use crate::{connection::WlConnectionMessage, BufExt, BufMutExt};
+use crate::{connection::WlConnectionMessage, interfaces, BufExt, BufMutExt};
 
 pub type Signature = &'static [&'static [ArgumentType]];
+
+#[derive(Debug, Clone)]
+pub struct IdRegistry {
+    storage: Arc<Mutex<u32>>,
+}
+
+impl IdRegistry {
+    pub fn new_id(&self) -> NewId {
+        let mut guard = self.storage.lock().unwrap();
+        *guard += 1;
+        NewId {
+            id: *guard,
+            storage: self.clone(),
+        }
+    }
+
+    pub fn new() -> (Self, Id) {
+        let reg = Self {
+            storage: Arc::new(Mutex::new(1)),
+        };
+
+        (
+            reg.clone(),
+            Id {
+                id: 1,
+                storage: reg,
+            },
+        )
+    }
+}
+
+impl PartialEq for IdRegistry {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.storage, &other.storage)
+    }
+}
+
+impl Eq for IdRegistry {}
+
+impl std::hash::Hash for IdRegistry {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        ptr::hash(Arc::as_ptr(&self.storage), state);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Id {
+    id: u32,
+    storage: IdRegistry,
+}
+
+impl Id {
+    fn clone(&self) -> Id {
+        Id {
+            id: self.id,
+            storage: self.storage.clone(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct NewId {
+    id: u32,
+    storage: IdRegistry,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct LookupId {
+    id: u32,
+    storage: IdRegistry,
+}
+
+impl Id {
+    pub fn get_lookup(&self) -> LookupId {
+        LookupId {
+            id: self.id,
+            storage: self.storage.clone(),
+        }
+    }
+}
+
+impl NewId {
+    pub fn get_lookup(&self) -> LookupId {
+        LookupId {
+            id: self.id,
+            storage: self.storage.clone(),
+        }
+    }
+    fn into_id(&self) -> Id {
+        Id {
+            id: self.id,
+            storage: self.storage.clone(),
+        }
+    }
+}
+
+impl PartialEq<LookupId> for Id {
+    fn eq(&self, other: &LookupId) -> bool {
+        self.id == other.id
+    }
+}
+
+impl PartialEq<Id> for LookupId {
+    fn eq(&self, other: &Id) -> bool {
+        self.id == other.id
+    }
+}
+
+impl PartialEq<LookupId> for NewId {
+    fn eq(&self, other: &LookupId) -> bool {
+        self.id == other.id
+    }
+}
+
+impl PartialEq<NewId> for LookupId {
+    fn eq(&self, other: &NewId) -> bool {
+        self.id == other.id
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Header {
@@ -33,10 +151,10 @@ pub struct Header {
     pub opcode: u16,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Message {
     /// ID of the object sending this message
-    pub sender_id: u32,
+    pub sender_id: Id,
     /// Opcode of the message
     pub opcode: u16,
     /// Arguments of the message
@@ -44,8 +162,8 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn is_valid(&self, signature: Signature, id: u32) -> bool {
-        if self.sender_id != id {
+    pub fn is_valid(&self, signature: Signature, id: &Id) -> bool {
+        if self.sender_id != *id {
             return false;
         }
         if signature.len() <= self.opcode as usize {
@@ -80,7 +198,8 @@ pub struct RawMessage {
 
 const INLINE_ARGS: usize = 4;
 
-#[derive(Debug, Clone, EnumAsInner)]
+#[derive(Debug, EnumAsInner, EnumDiscriminants)]
+#[strum_discriminants(name(ArgumentType))]
 pub enum Argument {
     /// i32
     Int(i32),
@@ -96,7 +215,7 @@ pub enum Argument {
     /// id of a wayland object
     Object(u32),
     /// id of a newly created wayland object
-    NewId(u32),
+    NewId(NewId),
     /// Vec<u8>
     ///
     /// The value is boxed to reduce the stack size of Argument. The performance
@@ -104,32 +223,6 @@ pub enum Argument {
     Array(Box<Vec<u8>>),
     /// RawFd
     Fd(RawFd),
-}
-
-#[derive(Debug)]
-pub enum ArgumentType {
-    /// i32
-    Int,
-    /// u32
-    Uint,
-    /// fixed point, 1/256 precision
-    Fixed,
-    /// CString
-    ///
-    /// The value is boxed to reduce the stack size of Argument. The performance
-    /// impact is negligible as `string` arguments are pretty rare in the protocol.
-    Str,
-    /// id of a wayland object
-    Object,
-    /// id of a newly created wayland object
-    NewId,
-    /// Vec<u8>
-    ///
-    /// The value is boxed to reduce the stack size of Argument. The performance
-    /// impact is negligible as `array` arguments are pretty rare in the protocol.
-    Array,
-    /// RawFd
-    Fd,
 }
 
 #[derive(Error, Debug)]
@@ -167,14 +260,14 @@ pub trait RequestObject {
     type ReturnType: WaylandInterface;
     /// Apply this request to `interface`.
     /// Returns optionally a new Wayland interface for a new object and a Wayland message.
-    fn apply(self, self_id: u32, interface: &mut Self::Interface) -> (Self::ReturnType, Message);
-    fn id(&self) -> u32;
+    fn apply(self, self_id: Id, interface: &mut Self::Interface) -> (Self::ReturnType, Message);
+    fn id(&self) -> &NewId;
 }
 
 pub trait Request {
     type Interface: WaylandInterface;
 
-    fn apply(self, self_id: u32, interface: &mut Self::Interface) -> Message;
+    fn apply(self, self_id: Id, interface: &mut Self::Interface) -> Message;
 }
 
 pub trait Event: Sized {
@@ -189,8 +282,13 @@ pub trait Event: Sized {
 pub enum Processed<T> {
     Event(T),
     Destroyed(T),
-    Destroy(u32, T),
+    Destroy(LookupId, T),
     None,
+}
+
+pub enum Destruction {
+    Message(Message),
+    None(Id),
 }
 
 pub trait WaylandInterface {
@@ -198,8 +296,8 @@ pub trait WaylandInterface {
     fn request_signature() -> Signature;
     fn interface() -> &'static str;
     fn version() -> u32;
-    fn destroy(&mut self, self_id: u32) -> Option<Message> {
-        None
+    fn destroy(&mut self, self_id: Id) -> Destruction {
+        Destruction::None(self_id)
     }
 }
 
@@ -210,14 +308,17 @@ where
     D: WaylandInterface,
 {
     fn drop(&mut self) {
-        match self.data.destroy(self.id) {
-            Some(message) => {
-                block_on(self.request_tx.send(WlConnectionMessage::Destroy(self.id)))
-                    .expect("failed to send destroy message");
+        match self.data.destroy(self.id.clone()) {
+            Destruction::Message(message) => {
+                block_on(
+                    self.request_tx
+                        .send(WlConnectionMessage::Destroy(self.id.get_lookup())),
+                )
+                .expect("failed to send destroy message");
                 block_on(self.request_tx.send(WlConnectionMessage::Message(message)))
                     .expect("failed to send destroy message");
             }
-            None => {}
+            Destruction::None(_) => {}
         }
     }
 }
@@ -227,11 +328,10 @@ pub struct WlObject<
     R: Stream<Item = Message> + Unpin,
     D: WaylandInterface,
 > {
-    pub id_counter: Arc<RwLock<u32>>,
-    pub id: u32,
-    pub request_tx: T,
-    pub message_rx: R,
-    pub data: D,
+    id: Id,
+    request_tx: T,
+    message_rx: R,
+    data: D,
 }
 
 impl<
@@ -240,6 +340,15 @@ impl<
         D: WaylandInterface,
     > WlObject<T, R, D>
 {
+    pub(crate) fn new(id: Id, request_tx: T, message_rx: R, interface: D) -> Self {
+        Self {
+            id,
+            request_tx,
+            message_rx,
+            data: interface,
+        }
+    }
+
     pub async fn next_event<E: Event<Interface = D>>(&mut self) -> Result<Option<E>, WaylandError> {
         loop {
             match self.message_rx.next().await {
@@ -247,7 +356,7 @@ impl<
                     Processed::Event(event) => return Ok(Some(event)),
                     Processed::Destroyed(event) => {
                         self.request_tx
-                            .send(WlConnectionMessage::Destroy(self.id))
+                            .send(WlConnectionMessage::Destroy(self.id.get_lookup()))
                             .await?;
                         return Ok(Some(event));
                     }
@@ -264,19 +373,21 @@ impl<
         }
     }
 
-    pub fn get_new_id(&self) -> Result<u32, PoisonError<RwLockWriteGuard<u32>>> {
-        let mut guard = self.id_counter.write()?;
-        *guard += 1;
-        Ok(*guard)
+    pub fn get_new_id(&self) -> NewId {
+        self.id.storage.new_id()
+    }
+
+    pub fn get_registry(&self) -> IdRegistry {
+        self.id.storage.clone()
     }
 
     pub async fn request<Req: Request<Interface = D>>(
         &mut self,
         request: Req,
     ) -> Result<(), WaylandError> {
-        let message = request.apply(self.id, &mut self.data);
+        let message = request.apply(self.id.clone(), &mut self.data);
         assert!(
-            message.is_valid(D::request_signature(), self.id),
+            message.is_valid(D::request_signature(), &self.id),
             "message does not match signature"
         );
         self.request_tx
@@ -289,10 +400,11 @@ impl<
         &mut self,
         request: Req,
     ) -> Result<WlObject<T, ReceiverStream<Message>, Req::ReturnType>, WaylandError> {
-        let id = request.id();
-        let (return_value, request_message) = request.apply(self.id, &mut self.data);
+        let id = request.id().into_id();
+        let lookup_id = id.get_lookup();
+        let (return_value, request_message) = request.apply(self.id.clone(), &mut self.data);
         assert!(
-            request_message.is_valid(D::request_signature(), self.id),
+            request_message.is_valid(D::request_signature(), &self.id),
             "message does not match signature"
         );
         let (sender, receiver) = channel::<Message>(10);
@@ -300,15 +412,14 @@ impl<
         let receiver_stream = ReceiverStream::new(receiver);
 
         let object = WlObject {
-            id_counter: self.id_counter.clone(),
-            id,
+            id: id,
             request_tx: self.request_tx.clone(),
             message_rx: receiver_stream,
             data: return_value,
         };
         self.request_tx
             .send(WlConnectionMessage::Create(
-                id,
+                lookup_id,
                 Req::ReturnType::event_signature(),
                 sender_sink,
             ))
@@ -333,10 +444,11 @@ pub struct WlSocket {
     fds: VecDeque<RawFd>,
     header: Option<Header>,
     unprocessed_msg: Option<RawMessage>,
+    id_registry: IdRegistry,
 }
 
 impl WlSocket {
-    pub fn new(socket: UnixStream) -> io::Result<Self> {
+    pub fn new(socket: UnixStream, id_registry: IdRegistry) -> io::Result<Self> {
         socket.set_nonblocking(true)?;
         Ok(Self {
             inner: AsyncFd::new(socket)?,
@@ -348,6 +460,7 @@ impl WlSocket {
             fds: VecDeque::new(),
             header: None,
             unprocessed_msg: None,
+            id_registry,
         })
     }
 
@@ -386,9 +499,17 @@ impl WlSocket {
         }
     }
 
-    fn decode(&mut self, map: &HashMap<u32, Signature>) -> Result<Option<Message>, WaylandError> {
+    fn decode(
+        &mut self,
+        map: &HashMap<LookupId, Signature>,
+    ) -> Result<Option<Message>, WaylandError> {
         if let Some(mut raw_message) = self.unprocessed_msg.take() {
-            let event_map = map.get(&raw_message.header.object_id).unwrap();
+            let event_map = map
+                .get(&LookupId {
+                    id: raw_message.header.object_id,
+                    storage: self.id_registry.clone(),
+                })
+                .unwrap();
             let argument_list = *event_map.get(raw_message.header.opcode as usize).unwrap();
             if argument_list.len() > INLINE_ARGS {
                 panic!("Too many arguments for message")
@@ -411,7 +532,10 @@ impl WlSocket {
                         Argument::Str(Box::new(string))
                     }
                     ArgumentType::Object => Argument::Object(raw_message.args.get_u32_ne()),
-                    ArgumentType::NewId => Argument::NewId(raw_message.args.get_u32_ne()),
+                    ArgumentType::NewId => Argument::NewId(NewId {
+                        id: raw_message.args.get_u32_ne(),
+                        storage: self.id_registry.clone(),
+                    }),
                     ArgumentType::Array => todo!(),
                     ArgumentType::Fd => match self.fds.pop_front() {
                         Some(fd) => {
@@ -429,7 +553,10 @@ impl WlSocket {
                 args.push(argument);
             }
             let result_message = Message {
-                sender_id: raw_message.header.object_id,
+                sender_id: Id {
+                    id: raw_message.header.object_id,
+                    storage: self.id_registry.clone(),
+                },
                 opcode: raw_message.header.opcode,
                 args,
             };
@@ -461,13 +588,13 @@ impl WlSocket {
                     argument_bytes.put_bytes(0, pad as usize);
                 }
                 Argument::Object(val) => argument_bytes.put_u32_ne(val),
-                Argument::NewId(val) => argument_bytes.put_u32_ne(val),
+                Argument::NewId(val) => argument_bytes.put_u32_ne(val.id),
                 Argument::Array(val) => todo!(),
                 Argument::Fd(val) => fds.push(val),
             }
         }
 
-        self.write_buffer.put_u32_ne(msg.sender_id);
+        self.write_buffer.put_u32_ne(msg.sender_id.id);
         let val = (argument_bytes.len() + 8 << 16u16) as u32 | msg.opcode as u32;
         self.write_buffer.put_u32_ne(val);
         self.write_buffer.put_slice(argument_bytes);
@@ -477,7 +604,7 @@ impl WlSocket {
 
     pub async fn read_message(
         &mut self,
-        map: &HashMap<u32, Signature>,
+        map: &HashMap<LookupId, Signature>,
     ) -> Result<Message, WaylandError> {
         loop {
             return match self.decode(map)? {
@@ -505,7 +632,7 @@ impl WlSocket {
                         Ok(result) => result?,
                         Err(_) => continue,
                     };
-                    println!("read {} bytes", bytes_read);
+                    //println!("read {} bytes", bytes_read);
                     if bytes_read == 0 {
                         return Err(WaylandError::TryIoError);
                     }
@@ -517,12 +644,12 @@ impl WlSocket {
     }
 
     pub async fn write_message(&mut self, message: Message) -> Result<(), WaylandError> {
-        println!("writing message {:?}", message);
+        //println!("writing message {:?}", message);
         let fds = self.encode(message)?;
         let mut guard = self.inner.writable_mut().await?;
         match guard
             .try_io(|inner| {
-                println!("{:?}", self.write_buffer.as_ref());
+                //println!("{:?}", self.write_buffer.as_ref());
                 let iov = [IoSlice::new(&self.write_buffer)];
                 if !fds.is_empty() {
                     let cmsgs = [socket::ControlMessage::ScmRights(fds.as_slice())];
@@ -546,11 +673,11 @@ impl WlSocket {
             })
             .map_err(|_| WaylandError::TryIoError)
         {
-            Ok(it) => println!("{:?}", it),
+            Ok(it) => it?,
             Err(err) => return Err(err),
         };
         self.write_buffer.clear();
-        println!("written message");
+        //println!("written message");
         Ok(())
     }
 }
