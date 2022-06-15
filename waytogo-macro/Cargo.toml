@@ -5,5 +5,15 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lib]
+proc-macro = true
+
 [dependencies]
-syn = "*"
+serde = { version = "1", features = ["derive"] }
+quote = "1"
+proc-macro2 = "1"
+syn = { version = "1", features = ["parsing", "proc-macro"] }
+quick-xml = { version = "0.23", features = ["serialize"] }
+enum-as-inner = "0.5"
+heck = "*"
+hex = "0.4"
