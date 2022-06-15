@@ -23,8 +23,13 @@ use tokio_util::sync::{PollSendError, PollSender};
 
 use crate::{connection::WlConnectionMessage, interfaces, BufExt, BufMutExt};
 
+/// Message signature of Wayland objects
+///
+/// The first dimension specifies the message opcode.
+/// The second dimension contains a list of argument types to parse.
 pub type Signature = &'static [&'static [ArgumentType]];
 
+/// ID management for a Wayland connection
 #[derive(Debug, Clone)]
 pub struct IdRegistry {
     storage: Arc<Mutex<u32>>,
@@ -69,6 +74,7 @@ impl std::hash::Hash for IdRegistry {
     }
 }
 
+/// ID of a Wayland object to be used as sender ID for outgoing messages.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Id {
     id: u32,
@@ -84,12 +90,14 @@ impl Id {
     }
 }
 
+/// ID of a Wayland object to be used as argument for outgoing messages.
 #[derive(Debug, PartialEq, Eq)]
 pub struct NewId {
     id: u32,
     storage: IdRegistry,
 }
 
+/// ID of a Wayland object to be used as lookup handle.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct LookupId {
     id: u32,
@@ -145,12 +153,13 @@ impl PartialEq<NewId> for LookupId {
 }
 
 #[derive(Debug, Clone)]
-pub struct Header {
-    pub object_id: u32,
-    pub message_size: u16,
-    pub opcode: u16,
+struct Header {
+    object_id: u32,
+    message_size: u16,
+    opcode: u16,
 }
 
+/// Wire protocol message
 #[derive(Debug)]
 pub struct Message {
     /// ID of the object sending this message
@@ -158,7 +167,7 @@ pub struct Message {
     /// Opcode of the message
     pub opcode: u16,
     /// Arguments of the message
-    pub args: SmallVec<[Argument; INLINE_ARGS]>,
+    pub args: Vec<Argument>,
 }
 
 impl Message {
@@ -190,14 +199,15 @@ impl Message {
 }
 
 #[derive(Debug, Clone)]
-pub struct RawMessage {
-    pub header: Header,
+struct RawMessage {
+    header: Header,
     /// Arguments of the message
-    pub args: Bytes,
+    args: Bytes,
 }
 
-const INLINE_ARGS: usize = 4;
+const INLINE_ARGS: usize = 6;
 
+/// Message arguments
 #[derive(Debug, EnumAsInner, EnumDiscriminants)]
 #[strum_discriminants(name(ArgumentType))]
 pub enum Argument {
@@ -213,7 +223,7 @@ pub enum Argument {
     /// impact is negligible as `string` arguments are pretty rare in the protocol.
     Str(Box<CString>),
     /// id of a wayland object
-    Object(u32),
+    Object(LookupId),
     /// id of a newly created wayland object
     NewId(NewId),
     /// Vec<u8>
@@ -251,10 +261,7 @@ impl<T> From<PollSendError<T>> for WaylandError {
     }
 }
 
-/// Trait to be implemented on Wayland interface request types.
-///
-/// Although this trait can be implemented for foreign types,
-/// it is not of any use if the concrete type that implements WaylandInterface is private.
+/// Wayland requests that return a new object.
 pub trait RequestObject {
     type Interface: WaylandInterface;
     type ReturnType: WaylandInterface;
@@ -264,12 +271,14 @@ pub trait RequestObject {
     fn id(&self) -> &NewId;
 }
 
+/// Wayland requests that return no value.
 pub trait Request {
     type Interface: WaylandInterface;
 
     fn apply(self, self_id: Id, interface: &mut Self::Interface) -> Message;
 }
 
+/// Wayland event.
 pub trait Event: Sized {
     type Interface: WaylandInterface;
 
@@ -514,7 +523,7 @@ impl WlSocket {
             if argument_list.len() > INLINE_ARGS {
                 panic!("Too many arguments for message")
             }
-            let mut args = SmallVec::new();
+            let mut args = Vec::new();
             let mut used_fds = VecDeque::new();
             for arg in argument_list {
                 let argument = match arg {
@@ -531,7 +540,10 @@ impl WlSocket {
                         let string = CString::new(string_bytes.to_vec()).unwrap();
                         Argument::Str(Box::new(string))
                     }
-                    ArgumentType::Object => Argument::Object(raw_message.args.get_u32_ne()),
+                    ArgumentType::Object => Argument::Object(LookupId {
+                        id: raw_message.args.get_u32_ne(),
+                        storage: self.id_registry.clone(),
+                    }),
                     ArgumentType::NewId => Argument::NewId(NewId {
                         id: raw_message.args.get_u32_ne(),
                         storage: self.id_registry.clone(),
@@ -587,7 +599,7 @@ impl WlSocket {
                     let pad = 4 - (len % 4);
                     argument_bytes.put_bytes(0, pad as usize);
                 }
-                Argument::Object(val) => argument_bytes.put_u32_ne(val),
+                Argument::Object(val) => argument_bytes.put_u32_ne(val.id),
                 Argument::NewId(val) => argument_bytes.put_u32_ne(val.id),
                 Argument::Array(val) => todo!(),
                 Argument::Fd(val) => fds.push(val),

@@ -8,6 +8,7 @@ use std::{
 use phf::phf_map;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::PollSender;
+use waytogo_macro::wayland_protocol;
 
 use crate::wire::{
     Argument, ArgumentType, Event, Id, LookupId, Message, NewId, Processed, RequestObject,
@@ -19,7 +20,7 @@ use smallvec::smallvec;
 pub struct WlDisplay {}
 
 pub struct ErrorEvent {
-    pub object_id: u32,
+    pub object_id: LookupId,
     pub code: u32,
     pub message: String,
 }
@@ -58,7 +59,7 @@ impl RequestObject for GetRegistryRequest {
     type ReturnType = WlRegistry;
 
     fn apply(self, self_id: Id, _interface: &mut Self::Interface) -> (Self::ReturnType, Message) {
-        let args = smallvec![Argument::NewId(self.registry)];
+        let args = vec![Argument::NewId(self.registry)];
         let message = Message {
             sender_id: self_id,
             opcode: 1,
@@ -179,11 +180,11 @@ impl<T: WaylandInterface> RequestObject for BindRequest<T> {
             let message = Message {
                 sender_id: self_id,
                 opcode: 0,
-                args: smallvec![
+                args: vec![
                     Argument::Uint(self.name),
                     Argument::Str(Box::new(CString::new(T::interface()).unwrap())),
                     Argument::Uint(T::version()),
-                    Argument::NewId(self.id)
+                    Argument::NewId(self.id),
                 ],
             };
             return (self.interface, message);
@@ -321,4 +322,19 @@ impl WaylandInterface for WlShm {
     fn version() -> u32 {
         1
     }
+}
+
+pub mod generated {
+    use crate::wire::Argument;
+    use crate::wire::Id;
+    use crate::wire::LookupId;
+    use crate::wire::Message;
+    use crate::wire::NewId;
+    use crate::wire::Request;
+    use crate::wire::RequestObject;
+    use crate::wire::Signature;
+    use crate::wire::WaylandInterface;
+    use waytogo_macro::wayland_protocol;
+
+    wayland_protocol!("/usr/share/wayland/wayland.xml");
 }

@@ -16,4 +16,5 @@ syn = { version = "1", features = ["parsing", "proc-macro"] }
 quick-xml = { version = "0.23", features = ["serialize"] }
 enum-as-inner = "0.5"
 heck = "*"
-hex = "0.4"
+rust-format = { version = "0.3", features = ["post_process", "token_stream"] }
+regex = "1"

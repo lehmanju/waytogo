@@ -34,6 +34,7 @@ pub trait BufExt: Buf {
 
 impl<T> BufExt for T where T: Buf {}
 
+#[cfg(test)]
 mod tests {
     use crate::{
         connection::WaylandConnection,
