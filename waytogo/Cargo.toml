@@ -22,4 +22,4 @@ nix = { version = "0.24", features = ["uio", "socket"] }
 phf = { version = "0.10", features = ["macros"] }
 strum = "0.24"
 strum_macros = "0.24"
-waytogo-macro = { path = "../waytogo-macro" }
+waytogo-macro = { path = "../waytogo-macro", version = "0.1" }
